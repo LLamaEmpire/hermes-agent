@@ -148,6 +148,9 @@ export interface StoreState {
   status: string | undefined
   /** Live session chrome for the status bar (model/effort/cwd/branch/context/running). */
   info: SessionInfo
+  /** Transient hint shown above the composer (e.g. "Ctrl+C again to quit" — item 11);
+   *  takes visual priority over the busy `status` face. Undefined when none. */
+  hint: string | undefined
 }
 
 const LRU_LIMIT = 1000
@@ -231,7 +234,8 @@ export function createSessionStore() {
     subagents: [],
     dashboard: false,
     status: undefined,
-    info: {}
+    info: {},
+    hint: undefined
   })
 
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
@@ -362,6 +366,11 @@ export function createSessionStore() {
   /** Close the generic picker. */
   function closePicker() {
     setState('picker', undefined)
+  }
+
+  /** Set / clear the transient composer hint ("Ctrl+C again to quit" — item 11). */
+  function setHint(text: string | undefined): void {
+    setState('hint', text)
   }
 
   /** Merge a session-info patch into the chrome state (status bar — item 14). */
@@ -598,6 +607,7 @@ export function createSessionStore() {
     setCompletions,
     clearCompletions,
     applyInfo,
+    setHint,
     openDashboard,
     closeDashboard,
     hydrate,

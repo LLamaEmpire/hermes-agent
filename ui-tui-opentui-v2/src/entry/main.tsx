@@ -49,6 +49,8 @@ export interface TuiInput {
 
 const READY_POLL = Duration.millis(100)
 const READY_TIMEOUT_MS = 20_000
+/** Window after a Ctrl+C in which a second Ctrl+C quits the TUI (item 11). */
+const QUIT_WINDOW_MS = 3_000
 
 /**
  * Resume a session INTO the store: buffer live events across the `session.resume`
@@ -137,15 +139,64 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // Solid side: the store + reducer. Created here, lives in Solid-land.
       const store = createSessionStore()
 
-      // A blocking prompt owns Ctrl+C (→ cancel) — suppress the global quit while one is up.
-      const { renderer, shutdown } = yield* acquireRenderer({
-        mouse: input.mouse,
-        isBlocked: () => store.state.prompt !== undefined
-      })
-
       // Contact point #2: boundary pushes decoded events into the Solid store.
       const gateway = yield* GatewayService
       yield* gateway.subscribe(event => store.apply(event))
+
+      // ── Ctrl+C state machine (item 11) ──────────────────────────────────
+      // While a turn runs, the first Ctrl+C STOPS the agent (session.interrupt);
+      // a second Ctrl+C within QUIT_WINDOW_MS (or when idle) KILLS the TUI. The
+      // debounce stops a stray Ctrl+C from nuking the session (opencode's
+      // double-press model; the user's preferred behaviour).
+      let quitArmed = false
+      let quitTimer: ReturnType<typeof setTimeout> | undefined
+      let doQuit = () => {} // assigned once the renderer exists
+      const disarmQuit = () => {
+        quitArmed = false
+        if (quitTimer) clearTimeout(quitTimer)
+        quitTimer = undefined
+        store.setHint(undefined)
+      }
+      const armQuit = (message: string) => {
+        quitArmed = true
+        store.setHint(message)
+        if (quitTimer) clearTimeout(quitTimer)
+        quitTimer = setTimeout(disarmQuit, QUIT_WINDOW_MS)
+      }
+      const interruptTurn = () => {
+        const sid = gateway.sessionId()
+        if (!sid) return
+        Effect.runFork(
+          gateway
+            .request('session.interrupt', { session_id: sid })
+            .pipe(
+              Effect.catchCause(cause => Effect.sync(() => getLog().warn('interrupt', 'failed', { cause: String(cause) })))
+            )
+        )
+      }
+      const onCtrlC = () => {
+        if (quitArmed) {
+          disarmQuit()
+          doQuit()
+          return
+        }
+        if (store.state.info.running) {
+          interruptTurn()
+          armQuit('⏹ stopped — Ctrl+C again to quit')
+        } else {
+          armQuit('Ctrl+C again to quit')
+        }
+      }
+
+      // A blocking prompt owns Ctrl+C (→ cancel); otherwise the state machine above runs.
+      const { renderer, shutdown } = yield* acquireRenderer({
+        mouse: input.mouse,
+        isBlocked: () => store.state.prompt !== undefined,
+        onCtrlC
+      })
+      doQuit = () => {
+        if (!renderer.isDestroyed) renderer.destroy()
+      }
 
       // Submit a user turn: the service value is in hand, so `gateway.request(...)`
       // is Effect<…, never> — fire it detached with runFork; failures are logged.

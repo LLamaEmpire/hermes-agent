@@ -19,6 +19,12 @@ export interface RendererOptions {
   readonly mouse: boolean
   /** When true, a blocking prompt owns Ctrl+C (cancel) — the global quit is suppressed (gotcha §8 #6). */
   readonly isBlocked?: () => boolean
+  /**
+   * Ctrl+C handler (item 11). When set, it OWNS Ctrl+C while not blocked — the
+   * entry's state machine decides interrupt-the-turn vs quit. When omitted, the
+   * default is an immediate `renderer.destroy()` (quit).
+   */
+  readonly onCtrlC?: () => void
 }
 
 /**
@@ -57,7 +63,10 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
   // (gotcha §8 #6) — the prompt's own handler sends the cancel reply.
   const isBlocked = options.isBlocked ?? (() => false)
   renderer.keyInput.on('keypress', (key: KeyEvent) => {
-    if (key.ctrl && key.name === 'c' && !isBlocked() && !renderer.isDestroyed) renderer.destroy()
+    if (!(key.ctrl && key.name === 'c') || renderer.isDestroyed) return
+    if (isBlocked()) return // a blocking prompt owns Ctrl+C (→ deny/cancel)
+    if (options.onCtrlC) options.onCtrlC()
+    else renderer.destroy()
   })
 
   return { renderer, shutdown } as const

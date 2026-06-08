@@ -240,6 +240,15 @@ describe('session store — session chrome / status bar (item 14)', () => {
     store.applyInfo({ branch: 'dev' }) // partial patch — model/cwd must survive
     expect(store.state.info).toMatchObject({ model: 'gpt-5.4', cwd: '/tmp', branch: 'dev' })
   })
+
+  test('setHint sets/clears the transient composer hint (Ctrl+C again to quit — item 11)', () => {
+    const store = createSessionStore()
+    expect(store.state.hint).toBeUndefined()
+    store.setHint('Ctrl+C again to quit')
+    expect(store.state.hint).toBe('Ctrl+C again to quit')
+    store.setHint(undefined)
+    expect(store.state.hint).toBeUndefined()
+  })
 })
 
 describe('session store — resume hydrate (Phase 4b)', () => {
