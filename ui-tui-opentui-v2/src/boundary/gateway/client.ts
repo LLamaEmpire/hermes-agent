@@ -38,7 +38,10 @@ export interface RawClientOptions {
   readonly onExit?: (reason: string) => void
 }
 
-const REQUEST_TIMEOUT_MS = 120_000
+const REQUEST_TIMEOUT_MS = (() => {
+  const raw = Number.parseInt(process.env.HERMES_TUI_RPC_TIMEOUT_MS ?? '', 10)
+  return Number.isFinite(raw) && raw > 0 ? Math.max(5000, raw) : 120_000
+})()
 
 export class RawGatewayClient {
   private proc: ReturnType<typeof Bun.spawn> | null = null
