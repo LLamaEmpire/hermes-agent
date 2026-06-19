@@ -12,6 +12,9 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 
 const {
   SSH_ERROR,
@@ -245,6 +248,23 @@ test('open() is a no-op when the master is already alive', async () => {
   const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: '/tmp/d' })
   await conn.open()
   assert.deepEqual(ops, ['check'], 'alive master → no second spawn to open it')
+})
+
+test('open() creates the control-socket directory if it does not exist', async () => {
+  const dir = path.join(os.tmpdir(), `hermes-ssh-test-${process.pid}-${Date.now()}`)
+  assert.ok(!fs.existsSync(dir), 'precondition: control dir absent')
+  const spawnFn = scriptedSpawn(args => (args.includes('check') ? { code: 255 } : { code: 0 }))
+  const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: dir })
+  try {
+    await conn.open()
+    assert.ok(fs.existsSync(dir), 'open() created the control-socket directory before spawning ssh')
+  } finally {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+    } catch {
+      /* ignore */
+    }
+  }
 })
 
 test('open() surfaces a classified auth error', async () => {

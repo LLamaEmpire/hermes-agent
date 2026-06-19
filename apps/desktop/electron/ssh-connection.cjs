@@ -36,6 +36,7 @@ const crypto = require('node:crypto')
 const net = require('node:net')
 const os = require('node:os')
 const path = require('node:path')
+const fs = require('node:fs')
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000
 const DEFAULT_EXEC_TIMEOUT_MS = 20_000
@@ -353,6 +354,15 @@ class SshConnection {
     if (await this.isAlive()) {
       this._opened = true
       return
+    }
+    // Ensure the control-socket directory exists — OpenSSH will not create
+    // intermediate dirs for ControlPath, so a fresh box (no prior hermes-ssh
+    // socket dir under $TMPDIR) would otherwise fail before the first connect.
+    // 0o700: the socket grants command execution on the master; keep it private.
+    try {
+      fs.mkdirSync(path.dirname(this.controlPath), { recursive: true, mode: 0o700 })
+    } catch {
+      // best effort — a pre-existing dir or a races-with-another-conn mkdir is fine
     }
     const args = buildMasterArgs(this, this._connectTimeoutMs)
     this._logLine(`opening control master to ${target(this.user, this.host)}:${this.port}`)
