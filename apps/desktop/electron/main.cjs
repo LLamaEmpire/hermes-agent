@@ -37,6 +37,9 @@ const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
 const { adoptServedDashboardToken } = require('./dashboard-token.cjs')
 const { waitForDashboardPort } = require('./backend-ready.cjs')
+const { SSH_ERROR, SshConnection, pickLocalPort, redactSecrets } = require('./ssh-connection.cjs')
+const remoteLifecycle = require('./remote-lifecycle.cjs')
+const { collectSshConfigHosts, parseSshGOutput } = require('./ssh-config.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-marketplace.cjs')
 const { buildDesktopBackendEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
@@ -63,10 +66,13 @@ const {
   connectionScopeKey,
   cookiesHaveSession,
   cookiesHaveLiveSession,
+  hostLabelFromBaseUrl,
   normAuthMode,
   normalizeRemoteBaseUrl,
+  normalizeSshConfig,
   pathWithGlobalRemoteProfile,
   profileRemoteOverride,
+  profileSshOverride,
   resolveAuthMode,
   resolveTestWsUrl,
   tokenPreview
@@ -4077,6 +4083,20 @@ function sanitizeConnectionProfiles(raw) {
       continue
     }
 
+    // SSH-mode entries carry host/user/port/keyPath/remoteHermesPath instead of
+    // a url, and (like remote entries) an encrypted token blob — the per-
+    // connection dashboard session token minted in main, NOT a user secret.
+    if (entry.mode === 'ssh') {
+      const ssh = normalizeSshConfig(entry)
+      if (ssh) {
+        if (entry.token && typeof entry.token === 'object') {
+          ssh.token = entry.token
+        }
+        out[name] = ssh
+      }
+      continue
+    }
+
     const cleaned = { mode: entry.mode === 'remote' ? 'remote' : 'local' }
     const url = String(entry.url || '').trim()
     if (url) {
@@ -4120,7 +4140,10 @@ function readDesktopConnectionConfig() {
       // backward compatibility with configs written before OAuth support.
       remote.authMode = remote.authMode === 'oauth' ? 'oauth' : 'token'
       config = {
-        mode: parsed.mode === 'remote' ? 'remote' : 'local',
+        // 'ssh' joins 'remote'/'local' as a top-level mode; SSH connection
+        // fields (host/user/port/keyPath/remoteHermesPath) ride on the `remote`
+        // sub-object, which is preserved verbatim below.
+        mode: parsed.mode === 'remote' ? 'remote' : parsed.mode === 'ssh' ? 'ssh' : 'local',
         remote,
         // Per-profile remote overrides: each profile may point at its own
         // backend (local spawn or its own remote URL). Preserved verbatim so
@@ -4188,10 +4211,30 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 
   const envOverride = key ? false : Boolean(process.env.HERMES_DESKTOP_REMOTE_URL)
 
+  const scopedMode = key ? scoped?.mode : config.mode
+
+  // SSH-mode block: surface the connection fields (no token to the renderer —
+  // it's an internal artifact). remoteTokenSet reports whether a dashboard
+  // token has already been adopted (i.e. a running dashboard can be reused).
+  if (scopedMode === 'ssh') {
+    const sshConfig = normalizeSshConfig({ mode: 'ssh', ...block })
+    return {
+      mode: 'ssh',
+      profile: key,
+      sshHost: sshConfig?.host || '',
+      sshUser: sshConfig?.user || '',
+      sshPort: sshConfig?.port || null,
+      sshKeyPath: sshConfig?.keyPath || '',
+      sshRemoteHermesPath: sshConfig?.remoteHermesPath || '',
+      remoteTokenSet: Boolean(decryptDesktopSecret(block.token)),
+      envOverride: false
+    }
+  }
+
   const remoteToken = decryptDesktopSecret(block.token)
   const authMode = normAuthMode(block.authMode)
   const remoteUrl = envOverride ? String(process.env.HERMES_DESKTOP_REMOTE_URL || '') : String(block.url || '')
-  const mode = envOverride || (key ? scoped?.mode : config.mode) === 'remote' ? 'remote' : 'local'
+  const mode = envOverride || scopedMode === 'remote' ? 'remote' : 'local'
 
   let remoteOauthConnected = false
   if (authMode === 'oauth' && remoteUrl) {
@@ -4234,7 +4277,21 @@ function buildRemoteBlock(remoteUrl, authMode, token) {
 function coerceDesktopConnectionConfig(input = {}, existing = readDesktopConnectionConfig(), options = {}) {
   const persistToken = options.persistToken !== false
   const key = connectionScopeKey(input.profile)
-  const mode = input.mode === 'remote' ? 'remote' : 'local'
+  const mode = input.mode === 'remote' ? 'remote' : input.mode === 'ssh' ? 'ssh' : 'local'
+
+  // SSH-mode save: connection fields are host/user/port/keyPath/remoteHermesPath
+  // (no user-entered token; the dashboard token is minted + reconciled at
+  // bootstrap and persisted separately). A saved SSH block preserves any
+  // already-adopted token so a reconnect can reuse the running dashboard.
+  if (mode === 'ssh') {
+    const sshBlock = buildSshBlock(input, key ? existing.profiles?.[key] || {} : existing.remote || {})
+    if (key) {
+      const profiles = { ...(existing.profiles || {}) }
+      profiles[key] = sshBlock
+      return { mode: existing.mode === 'remote' || existing.mode === 'ssh' ? existing.mode : 'local', remote: existing.remote || {}, profiles }
+    }
+    return { mode: 'ssh', remote: sshBlock, profiles: existing.profiles || {} }
+  }
 
   // The block being edited: a per-profile entry or the global remote block.
   const existingBlock = key ? existing.profiles?.[key] || {} : existing.remote || {}
@@ -4257,7 +4314,7 @@ function coerceDesktopConnectionConfig(input = {}, existing = readDesktopConnect
     } else {
       delete profiles[key]
     }
-    return { mode: existing.mode === 'remote' ? 'remote' : 'local', remote: existing.remote || {}, profiles }
+    return { mode: existing.mode === 'remote' || existing.mode === 'ssh' ? existing.mode : 'local', remote: existing.remote || {}, profiles }
   }
 
   const nextRemote =
@@ -4269,13 +4326,41 @@ function coerceDesktopConnectionConfig(input = {}, existing = readDesktopConnect
   return { mode, remote: nextRemote, profiles: existing.profiles || {} }
 }
 
+// Build an SSH connection block from a save payload, preserving an
+// already-adopted dashboard token from the existing block (the token is minted
+// + reconciled at bootstrap, never user-entered). `mode: 'ssh'` is stamped so
+// normalizeSshConfig/profileSshOverride recognize it.
+function buildSshBlock(input, existingBlock = {}) {
+  const merged = normalizeSshConfig({
+    mode: 'ssh',
+    host: input.sshHost ?? existingBlock.host,
+    user: input.sshUser ?? existingBlock.user,
+    port: input.sshPort ?? existingBlock.port,
+    keyPath: input.sshKeyPath ?? existingBlock.keyPath,
+    remoteHermesPath: input.sshRemoteHermesPath ?? existingBlock.remoteHermesPath
+  })
+  if (!merged) {
+    throw new Error('SSH host is required.')
+  }
+  // Carry forward an already-adopted dashboard token unless the host changed
+  // (a different host invalidates the old dashboard's token).
+  if (existingBlock.token && existingBlock.host === merged.host) {
+    merged.token = existingBlock.token
+  }
+  return merged
+}
+
 // Build a remote backend connection descriptor from an already-resolved remote
 // config. Handles both auth models (OAuth ws-ticket vs static session token)
 // and is shared by the per-profile, env, and global resolution paths. `token`
 // is the DECRYPTED static token (or null in OAuth mode). `source` is a label
 // for diagnostics ('profile' | 'env' | 'settings').
-async function buildRemoteConnection(rawUrl, authMode, token, source) {
+async function buildRemoteConnection(rawUrl, authMode, token, source, remoteHost) {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
+  // For token/oauth remotes the meaningful host is the real backend URL; for
+  // SSH remotes the caller passes the entered/resolved host explicitly (the
+  // baseUrl is a 127.0.0.1 tunnel and would be useless in the pill).
+  const host = remoteHost || hostLabelFromBaseUrl(baseUrl)
 
   if (authMode === 'oauth') {
     // OAuth gateway: auth comes from the session cookies in the OAuth
@@ -4312,6 +4397,7 @@ async function buildRemoteConnection(rawUrl, authMode, token, source) {
       mode: 'remote',
       source,
       authMode: 'oauth',
+      remoteHost: host || undefined,
       // No static token in OAuth mode; REST is cookie-authed via the partition.
       token: null,
       wsUrl: buildGatewayWsUrlWithTicket(baseUrl, ticket)
@@ -4330,8 +4416,163 @@ async function buildRemoteConnection(rawUrl, authMode, token, source) {
     mode: 'remote',
     source,
     authMode: 'token',
+    remoteHost: host || undefined,
     token,
     wsUrl: buildGatewayWsUrl(baseUrl, token)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SSH remote-mode bootstrap
+//
+// SSH mode is architecturally desktop-local mode with the loopback stretched
+// over SSH: open a ControlMaster, bring up (or reuse) a dedicated --isolated
+// dashboard on the remote, forward 127.0.0.1:<local> -> 127.0.0.1:<remote>,
+// then hand the EXISTING token-remote machinery a 127.0.0.1 baseUrl. Everything
+// downstream (REST bridge, /api/ws, sessions, /api/fs/*, version/update pills)
+// is unchanged — it keys off the connection descriptor, not how it was made.
+// ---------------------------------------------------------------------------
+
+// Live SSH connections keyed by scope ('' for global, or the profile name).
+// Holds the SshConnection (the control master), the tunnel ports, and the
+// remote pid so liveness/reconnect/teardown can find them. Survives across
+// resolveRemoteBackend calls within one app run.
+const sshConnections = new Map()
+
+function sshScopeKey(profile) {
+  return connectionScopeKey(profile) || ''
+}
+
+// Redaction-wrapped logger so NOTHING that flows through the SSH lifecycle
+// (spawn command lines carry the session token) reaches desktop.log raw.
+function sshRememberLog(chunk) {
+  rememberLog(redactSecrets(String(chunk == null ? '' : chunk)))
+}
+
+// Authenticated GET /api/status through the tunnel — the authoritative reuse
+// probe. True iff the dashboard answers ok with this token.
+async function sshProbeStatus(baseUrl, token) {
+  try {
+    await fetchJson(`${baseUrl}/api/status`, token)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// Tear down a scope's SSH state: cancel the forward, close the master, forget
+// it. Leaves the REMOTE dashboard running (reconnect is instant; in-flight
+// agent turns survive a client drop) — that is the VS Code semantics the spec
+// chose. The lockfile reuse flow recovers it on next connect.
+async function teardownSshConnection(profile) {
+  const scope = sshScopeKey(profile)
+  const state = sshConnections.get(scope)
+  if (!state) return
+  sshConnections.delete(scope)
+  try {
+    if (state.localPort && state.remotePort) {
+      await state.ssh.cancelForward(state.localPort, state.remotePort)
+    }
+  } catch {
+    // best effort
+  }
+  try {
+    await state.ssh.close()
+  } catch {
+    // best effort
+  }
+}
+
+// Bring up (or reuse) the SSH-tunneled dashboard for one scope and return a
+// token-remote connection descriptor. `sshConfig` is the normalized
+// { host, user?, port?, keyPath?, remoteHermesPath? }; `reuseToken` is the
+// decrypted per-connection token from encrypted storage (or '').
+async function bootstrapSshConnection(profile, sshConfig, reuseToken, source) {
+  const scope = sshScopeKey(profile)
+  const hostLabel = sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host
+
+  // Reuse a live master for this scope if we still have one; otherwise open
+  // fresh. A dead master (sleep/network flap) is closed and reopened.
+  let ssh = sshConnections.get(scope)?.ssh
+  if (ssh && !(await ssh.isAlive())) {
+    try {
+      await ssh.close()
+    } catch {
+      // ignore
+    }
+    ssh = null
+    sshConnections.delete(scope)
+  }
+  if (!ssh) {
+    ssh = new SshConnection(
+      { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
+      { rememberLog: sshRememberLog }
+    )
+    await ssh.open()
+  }
+
+  let result
+  try {
+    result = await remoteLifecycle.connect({
+      ssh,
+      profile: connectionScopeKey(profile) || '',
+      remoteHermesPath: sshConfig.remoteHermesPath || '',
+      clientId: scope || 'default',
+      reuseToken: reuseToken || '',
+      forward: (localPort, remotePort) => ssh.forward(localPort, remotePort),
+      cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
+      pickLocalPort,
+      waitForHermes,
+      probeStatus: sshProbeStatus,
+      adoptServedToken: adoptServedDashboardToken,
+      rememberLog: sshRememberLog
+    })
+  } catch (error) {
+    // Map lifecycle/SSH failures into a single actionable message; the boot
+    // overlay shows this verbatim instead of the generic gateway error.
+    const err = new Error(error.message)
+    err.sshError = error.kind || 'unknown'
+    err.isSshBootstrap = true
+    throw err
+  }
+
+  // Persist the served token (encrypted) so the next launch can reuse this
+  // dashboard via the lockfile fingerprint without re-bootstrapping.
+  persistSshConnectionToken(profile, source, result.token)
+
+  sshConnections.set(scope, {
+    ssh,
+    localPort: result.localPort,
+    remotePort: result.remotePort,
+    pid: result.pid,
+    host: sshConfig.host,
+    hostLabel
+  })
+
+  // Hand the existing token-remote machinery the loopback baseUrl. The pill's
+  // host is the SSH host, NOT 127.0.0.1.
+  return buildRemoteConnection(result.baseUrl, 'token', result.token, source, hostLabel)
+}
+
+// Save the served token back into the SSH connection entry (encrypted), so a
+// later launch reuses the running dashboard. Global SSH lives under
+// config.remote; a per-profile SSH override lives under config.profiles[name].
+function persistSshConnectionToken(profile, source, token) {
+  try {
+    const config = readDesktopConnectionConfig()
+    const encrypted = encryptDesktopSecret(token)
+    if (source === 'profile') {
+      const key = connectionScopeKey(profile)
+      if (key && config.profiles?.[key]?.mode === 'ssh') {
+        config.profiles[key].token = encrypted
+        writeDesktopConnectionConfig(config)
+      }
+    } else if (config.mode === 'ssh' && config.remote) {
+      config.remote.token = encrypted
+      writeDesktopConnectionConfig(config)
+    }
+  } catch (error) {
+    sshRememberLog(`[ssh] could not persist served token: ${error.message}`)
   }
 }
 
@@ -4348,6 +4589,12 @@ async function resolveRemoteBackend(profile) {
   // 1. Per-profile override — "a profile with its own remote host". Wins even
   //    over the env override so an explicitly-configured profile always
   //    reaches its intended backend.
+  const sshOverride = profileSshOverride(config, profile)
+  if (sshOverride) {
+    const reuseToken = decryptDesktopSecret(config.profiles?.[connectionScopeKey(profile)]?.token)
+    return bootstrapSshConnection(profile, sshOverride, reuseToken, 'profile')
+  }
+
   const override = profileRemoteOverride(config, profile)
   if (override) {
     const token = override.authMode === 'oauth' ? null : decryptDesktopSecret(override.token)
@@ -4368,6 +4615,17 @@ async function resolveRemoteBackend(profile) {
   }
 
   // 3. Global remote.
+  //    3a. Global SSH remote — bootstrap the tunnel + dashboard, hand the
+  //        token-remote machinery a loopback baseUrl.
+  if (config.mode === 'ssh') {
+    const ssh = normalizeSshConfig({ mode: 'ssh', ...(config.remote || {}) })
+    if (!ssh) {
+      throw new Error('SSH remote mode is selected but no host is configured. Open Settings → Gateway → Connect via SSH.')
+    }
+    const reuseToken = decryptDesktopSecret(config.remote?.token)
+    return bootstrapSshConnection(null, ssh, reuseToken, 'settings')
+  }
+
   if (config.mode !== 'remote') {
     return null
   }
@@ -4478,6 +4736,52 @@ async function probeRemoteAuthMode(rawUrl) {
 }
 
 async function testDesktopConnectionConfig(input = {}) {
+  // SSH mode: test reachability + that hermes is locatable on a supported
+  // platform, WITHOUT spawning a dashboard. Distinct errors for unreachable /
+  // auth-failed / hermes-not-found / unsupported-platform.
+  if (input.mode === 'ssh') {
+    const sshConfig = normalizeSshConfig({
+      mode: 'ssh',
+      host: input.sshHost,
+      user: input.sshUser,
+      port: input.sshPort,
+      keyPath: input.sshKeyPath,
+      remoteHermesPath: input.sshRemoteHermesPath
+    })
+    if (!sshConfig) {
+      return { reachable: false, sshError: 'unreachable', error: 'SSH host is required.' }
+    }
+    const ssh = new SshConnection(
+      { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
+      { rememberLog: sshRememberLog }
+    )
+    try {
+      await ssh.open()
+      const platform = await remoteLifecycle.probeRemotePlatform(ssh)
+      const hermesPath = await remoteLifecycle.locateHermes(ssh, sshConfig.remoteHermesPath || '')
+      return {
+        reachable: true,
+        sshError: null,
+        error: null,
+        remotePlatform: `${platform.os}/${platform.arch}`,
+        remoteHermesPath: hermesPath,
+        host: sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host
+      }
+    } catch (error) {
+      return {
+        reachable: false,
+        sshError: error.kind || 'unknown',
+        error: error.message
+      }
+    } finally {
+      try {
+        await ssh.close()
+      } catch {
+        // best effort — a transient test connection
+      }
+    }
+  }
+
   const config = coerceDesktopConnectionConfig(input, readDesktopConnectionConfig(), { persistToken: false })
   const key = connectionScopeKey(input.profile)
   // The block under test: a per-profile entry or the global remote. Coerce has
@@ -5387,6 +5691,51 @@ ipcMain.handle('hermes:connection-config:get', async (_event, profile) =>
   sanitizeDesktopConnectionConfig(readDesktopConnectionConfig(), profile)
 )
 ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testDesktopConnectionConfig(payload))
+ipcMain.handle('hermes:connection-config:ssh-hosts', async () => {
+  // Read-only host suggestions from ~/.ssh/config (+ Includes). Never writes.
+  try {
+    return { hosts: collectSshConfigHosts() }
+  } catch {
+    return { hosts: [] }
+  }
+})
+ipcMain.handle('hermes:connection-config:ssh-resolve', async (_event, host) => {
+  // Resolve the effective target with `ssh -G <host>` (short timeout) so the
+  // UI can show/normalize the real hostname/user/port/identityfile a host
+  // alias expands to. Best-effort: a failure returns nulls, not an error.
+  const target = String(host || '').trim()
+  if (!target) return { hostname: null, user: null, port: null, identityFile: null }
+  return new Promise(resolve => {
+    let out = ''
+    let settled = false
+    const child = spawn('ssh', ['-G', target], { stdio: ['ignore', 'pipe', 'ignore'] })
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        // already gone
+      }
+      resolve({ hostname: null, user: null, port: null, identityFile: null })
+    }, 5_000)
+    child.stdout.on('data', d => {
+      out += d.toString()
+    })
+    child.on('error', () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ hostname: null, user: null, port: null, identityFile: null })
+    })
+    child.on('close', () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(parseSshGOutput(out))
+    })
+  })
+})
 ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
 ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) => {
   // Open the gateway's OAuth login window and wait for the session cookie to
@@ -5416,6 +5765,10 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   writeDesktopConnectionConfig(config)
 
   const key = connectionScopeKey(payload?.profile)
+
+  // A connection change for this scope invalidates any live SSH tunnel for it —
+  // tear it down so the next resolve re-bootstraps against the new target.
+  await teardownSshConnection(key || null)
 
   if (key && key !== primaryProfileKey()) {
     // Editing a NON-primary profile's connection: don't disturb the window's
@@ -6561,6 +6914,13 @@ app.on('before-quit', () => {
     hermesProcess.kill('SIGTERM')
   }
   stopAllPoolBackends()
+
+  // Close SSH control masters (best-effort, fire-and-forget). The REMOTE
+  // dashboards are intentionally LEFT running so a relaunch reconnects via the
+  // lockfile reuse flow without re-bootstrapping (VS Code semantics).
+  for (const scope of [...sshConnections.keys()]) {
+    void teardownSshConnection(scope || null)
+  }
 })
 
 app.on('window-all-closed', () => {

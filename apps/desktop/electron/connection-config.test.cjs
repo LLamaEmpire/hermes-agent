@@ -22,10 +22,13 @@ const {
   connectionScopeKey,
   cookiesHaveSession,
   cookiesHaveLiveSession,
+  hostLabelFromBaseUrl,
   normAuthMode,
   normalizeRemoteBaseUrl,
+  normalizeSshConfig,
   pathWithGlobalRemoteProfile,
   profileRemoteOverride,
+  profileSshOverride,
   resolveAuthMode,
   resolveTestWsUrl,
   tokenPreview
@@ -393,4 +396,52 @@ test('resolveTestWsUrl (oauth) requires a mintTicket function', async () => {
     () => resolveTestWsUrl('https://gw.example.com', 'oauth', null),
     /mintTicket function is required/
   )
+})
+
+// --- SSH mode helpers ---
+
+test('normalizeSshConfig requires mode:ssh and a host', () => {
+  assert.equal(normalizeSshConfig(null), null)
+  assert.equal(normalizeSshConfig({ mode: 'remote', url: 'http://x' }), null)
+  assert.equal(normalizeSshConfig({ mode: 'ssh' }), null)
+  assert.equal(normalizeSshConfig({ mode: 'ssh', host: '   ' }), null)
+  assert.deepEqual(normalizeSshConfig({ mode: 'ssh', host: 'box' }), { mode: 'ssh', host: 'box' })
+})
+
+test('normalizeSshConfig keeps user/keyPath/remoteHermesPath and drops the default port', () => {
+  assert.deepEqual(
+    normalizeSshConfig({
+      mode: 'ssh',
+      host: 'box',
+      user: 'me',
+      port: 22,
+      keyPath: '~/.ssh/id_ed25519',
+      remoteHermesPath: '/opt/hermes'
+    }),
+    { mode: 'ssh', host: 'box', user: 'me', keyPath: '~/.ssh/id_ed25519', remoteHermesPath: '/opt/hermes' }
+  )
+})
+
+test('normalizeSshConfig preserves a non-default port', () => {
+  assert.deepEqual(normalizeSshConfig({ mode: 'ssh', host: 'box', port: 2222 }), {
+    mode: 'ssh',
+    host: 'box',
+    port: 2222
+  })
+})
+
+test('profileSshOverride returns a profile-scoped ssh descriptor or null', () => {
+  const config = { profiles: { work: { mode: 'ssh', host: 'mac-mini', user: 'jonny' }, other: { mode: 'remote', url: 'http://x' } } }
+  assert.deepEqual(profileSshOverride(config, 'work'), { mode: 'ssh', host: 'mac-mini', user: 'jonny' })
+  assert.equal(profileSshOverride(config, 'other'), null, 'token-remote entry is not an ssh override')
+  assert.equal(profileSshOverride(config, 'missing'), null)
+  assert.equal(profileSshOverride(config, ''), null, 'global scope has no profile entry')
+})
+
+test('hostLabelFromBaseUrl gives a bare host, with :port only when non-default', () => {
+  assert.equal(hostLabelFromBaseUrl('https://box.tail1234.ts.net'), 'box.tail1234.ts.net')
+  assert.equal(hostLabelFromBaseUrl('http://box.local:8080'), 'box.local:8080')
+  assert.equal(hostLabelFromBaseUrl('https://box:443'), 'box')
+  assert.equal(hostLabelFromBaseUrl(''), null)
+  assert.equal(hostLabelFromBaseUrl('not a url'), null)
 })

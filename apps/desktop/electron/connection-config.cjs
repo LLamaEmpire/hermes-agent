@@ -269,6 +269,71 @@ function cookiesHaveLiveSession(cookies) {
   )
 }
 
+/**
+ * Normalize a stored SSH connection entry into a clean descriptor, or null when
+ * it is not a usable SSH config. Pure: no secrets here — the per-connection
+ * dashboard token is persisted separately (encrypted) and decrypted by main.cjs,
+ * exactly like the token-remote secret. An SSH entry needs at least a host.
+ *
+ * Shape in/out: { mode:'ssh', host, user?, port?, keyPath?, remoteHermesPath? }
+ */
+function normalizeSshConfig(entry) {
+  if (!entry || typeof entry !== 'object' || entry.mode !== 'ssh') {
+    return null
+  }
+  const host = String(entry.host || '').trim()
+  if (!host) {
+    return null
+  }
+  const out = { mode: 'ssh', host }
+  const user = String(entry.user || '').trim()
+  if (user) out.user = user
+  const port = Number.parseInt(String(entry.port ?? ''), 10)
+  if (Number.isInteger(port) && port > 0 && port !== 22) {
+    out.port = port
+  }
+  const keyPath = String(entry.keyPath || '').trim()
+  if (keyPath) out.keyPath = keyPath
+  const remoteHermesPath = String(entry.remoteHermesPath || '').trim()
+  if (remoteHermesPath) out.remoteHermesPath = remoteHermesPath
+  return out
+}
+
+/**
+ * Select a profile's SSH connection override from a connection config, or null
+ * when it has none. Mirrors profileRemoteOverride() but for `mode: 'ssh'`
+ * entries. Returns the normalized SSH descriptor (no token).
+ */
+function profileSshOverride(config, profile) {
+  const key = connectionScopeKey(profile)
+  const entry = key ? config?.profiles?.[key] : null
+  return normalizeSshConfig(entry)
+}
+
+/**
+ * Human-facing host label for the connection statusbar pill. For SSH mode the
+ * caller passes the resolved/entered host directly; for token/oauth remotes we
+ * derive it from the (real) backend URL — NOT the loopback tunnel URL. Returns
+ * a bare hostname (and :port when non-default) or null.
+ */
+function hostLabelFromBaseUrl(baseUrl) {
+  const raw = String(baseUrl || '').trim()
+  if (!raw) return null
+  let parsed
+  try {
+    parsed = new URL(raw)
+  } catch {
+    return null
+  }
+  const host = parsed.hostname
+  if (!host) return null
+  const port = parsed.port
+  if (port && port !== '80' && port !== '443') {
+    return `${host}:${port}`
+  }
+  return host
+}
+
 module.exports = {
   AT_COOKIE_VARIANTS,
   RT_COOKIE_VARIANTS,
@@ -278,10 +343,13 @@ module.exports = {
   connectionScopeKey,
   cookiesHaveSession,
   cookiesHaveLiveSession,
+  hostLabelFromBaseUrl,
   normAuthMode,
   normalizeRemoteBaseUrl,
+  normalizeSshConfig,
   pathWithGlobalRemoteProfile,
   profileRemoteOverride,
+  profileSshOverride,
   resolveAuthMode,
   resolveTestWsUrl,
   tokenPreview
