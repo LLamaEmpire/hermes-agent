@@ -139,6 +139,70 @@ def test_is_signal_turn_detects_corrections_and_facts():
 
 
 # ---------------------------------------------------------------------------
+# pre-pass (cheap-model signal extraction prepended to the digest)
+# ---------------------------------------------------------------------------
+
+def _fake_resp(text):
+    from types import SimpleNamespace
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+
+
+def test_prepass_brief_returned_and_labeled():
+    old = [_msg("user", "for context I run proxmox"), _msg("assistant", "noted")]
+    with patch("agent.auxiliary_client.call_llm",
+               return_value=_fake_resp("FACT | user runs a 3-node proxmox cluster")):
+        brief = br._extract_signal_brief(old)
+    assert brief is not None
+    assert "PRE-SCREENED LEARNING CANDIDATES" in brief
+    assert "proxmox" in brief
+
+
+def test_prepass_none_response_falls_back():
+    old = [_msg("user", "what's 2+2"), _msg("assistant", "4")]
+    with patch("agent.auxiliary_client.call_llm", return_value=_fake_resp("NONE")):
+        assert br._extract_signal_brief(old) is None
+
+
+def test_prepass_exception_falls_back_silently():
+    old = [_msg("user", "for context I run proxmox"), _msg("assistant", "noted")]
+    with patch("agent.auxiliary_client.call_llm", side_effect=RuntimeError("boom")):
+        assert br._extract_signal_brief(old) is None  # never raises
+
+
+def test_build_history_prepass_prepends_brief_to_digest():
+    msgs = []
+    for i in range(60):
+        msgs.append(_msg("user", f"u{i} " + "x" * 300))
+        msgs.append(_msg("assistant", f"a{i} " + "y" * 300))
+    with patch("agent.auxiliary_client.call_llm",
+               return_value=_fake_resp("PREF | user wants terse answers")):
+        history, meta = br._build_review_history(
+            msgs, max_context_tokens=2000, digest_tail_messages=10,
+            use_prepass=True,
+        )
+    assert meta["digested"] is True
+    assert meta["prepass_used"] is True
+    assert "PRE-SCREENED LEARNING CANDIDATES" in history[0]["content"]
+    assert "user wants terse answers" in history[0]["content"]
+    # Tail still verbatim.
+    assert history[-1] == msgs[-1]
+
+
+def test_build_history_prepass_off_by_default():
+    msgs = []
+    for i in range(60):
+        msgs.append(_msg("user", f"u{i} " + "x" * 300))
+        msgs.append(_msg("assistant", f"a{i} " + "y" * 300))
+    # use_prepass defaults False → no call_llm, no brief.
+    with patch("agent.auxiliary_client.call_llm", side_effect=AssertionError("should not be called")):
+        history, meta = br._build_review_history(
+            msgs, max_context_tokens=2000, digest_tail_messages=10,
+        )
+    assert meta["prepass_used"] is False
+    assert "PRE-SCREENED" not in history[0]["content"]
+
+
+# ---------------------------------------------------------------------------
 # ④  adaptive cadence
 # ---------------------------------------------------------------------------
 

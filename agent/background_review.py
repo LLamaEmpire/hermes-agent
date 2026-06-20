@@ -128,9 +128,9 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         return parent
 
 
-def _read_review_budget() -> Dict[str, int]:
+def _read_review_budget() -> Dict[str, Any]:
     """Read snapshot context-budget knobs from auxiliary.background_review."""
-    out = {"max_context_tokens": 48000, "digest_tail_messages": 24}
+    out = {"max_context_tokens": 48000, "digest_tail_messages": 24, "prepass": False}
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -140,6 +140,8 @@ def _read_review_budget() -> Dict[str, int]:
             out["max_context_tokens"] = max(0, task["max_context_tokens"])
         if isinstance(task.get("digest_tail_messages"), int):
             out["digest_tail_messages"] = max(1, task["digest_tail_messages"])
+        if isinstance(task.get("prepass"), bool):
+            out["prepass"] = task["prepass"]
     except Exception:
         pass
     return out
@@ -278,10 +280,73 @@ def _digest_old_messages(old: List[Dict]) -> str:
     return "\n".join(parts)
 
 
+def _extract_signal_brief(
+    old: List[Dict],
+    agent_runtime: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Use a cheap auxiliary model to extract + rank durable learning signals.
+
+    The expensive review fork's failure mode on a long noisy session is
+    attention dilution: a one-line correction or persona fact is buried under
+    hundreds of unrelated turns. This pre-pass spends a small, cheap call on the
+    ``background_review`` auxiliary task to do the haystack search — read the
+    dropped older turns and return a SHORT ranked list of candidate learnings
+    (durable user facts/preferences, corrections, reusable techniques),
+    explicitly flagging anything the user asked to remember and anything later
+    retracted. The brief is prepended to the digest so the review fork judges a
+    clean, complete candidate set.
+
+    Returns the brief text, or None on any failure / empty result (caller falls
+    back to the lexical digest). Never raises.
+    """
+    if not old:
+        return None
+    transcript = _digest_old_messages(old)  # compact arc + lexical signals
+    try:
+        from agent.auxiliary_client import call_llm
+        prompt = (
+            "You are pre-screening an earlier slice of a conversation for a "
+            "background self-improvement review. List ONLY durable, reusable "
+            "learnings worth saving to long-term memory or a skill:\n"
+            "  • durable user facts / environment / identity / standing "
+            "constraints (esp. anything the user asked you to remember, assume, "
+            "or tailor to);\n"
+            "  • explicit corrections of style, workflow, or approach;\n"
+            "  • non-trivial techniques / fixes / debugging paths.\n\n"
+            "Rank most-important first. For each, one line: TYPE | the learning, "
+            "verbatim-ish. EXCLUDE one-off task chatter, transient errors that "
+            "resolved, and anything the user RETRACTED (note retractions "
+            "explicitly as 'RETRACTED: ...'). If nothing qualifies, reply "
+            "exactly 'NONE'.\n\nConversation slice:\n" + transcript[:24000]
+        )
+        resp = call_llm(
+            task="background_review",
+            main_runtime=agent_runtime,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=600,
+            timeout=60,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        if not text or text.strip().upper() == "NONE":
+            return None
+        return (
+            "PRE-SCREENED LEARNING CANDIDATES (a fast model surfaced these from "
+            "the earlier turns so they aren't lost — verify each against the "
+            "conversation and save the ones that genuinely warrant a memory or "
+            "skill; ignore any that don't):\n" + text
+        )
+    except Exception as e:
+        logger.debug("background-review pre-pass failed: %s", e, exc_info=True)
+        return None
+
+
 def _build_review_history(
     messages_snapshot: List[Dict],
     max_context_tokens: int,
     digest_tail_messages: int,
+    use_prepass: bool = False,
+    agent_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict], Dict[str, Any]]:
     """Return the (possibly trimmed) conversation_history for the review fork.
 
@@ -290,11 +355,19 @@ def _build_review_history(
     are kept verbatim and the older prefix is collapsed into a single synthetic
     user-role digest message, preserving role alternation at the seam.
 
+    When ``use_prepass`` is set, a cheap auxiliary model first scans the dropped
+    older turns and emits a ranked brief of candidate learnings, which is
+    prepended to the digest. This does the haystack search on a cheap model so
+    the (expensive) review fork judges a clean, complete signal set rather than
+    re-scanning noise — the lever for *improving* capture, not just preserving
+    it. Falls back silently to the lexical digest if the pre-pass yields nothing.
+
     The second return value is metadata for logging/metrics.
     """
     full_tokens = _rough_token_count(messages_snapshot)
     meta = {
         "digested": False,
+        "prepass_used": False,
         "full_tokens": full_tokens,
         "replayed_tokens": full_tokens,
         "full_messages": len(messages_snapshot or []),
@@ -318,7 +391,12 @@ def _build_review_history(
         tail = msgs[-digest_tail_messages:]
 
     old = msgs[:-len(tail)]
-    digest_msg = {"role": "user", "content": _digest_old_messages(old)}
+    brief = _extract_signal_brief(old, agent_runtime=agent_runtime) if use_prepass else None
+    digest_body = _digest_old_messages(old)
+    if brief:
+        digest_body = brief + "\n\n" + digest_body
+        meta["prepass_used"] = True
+    digest_msg = {"role": "user", "content": digest_body}
     history = [digest_msg] + tail
     meta["digested"] = True
     meta["replayed_tokens"] = _rough_token_count(history)
@@ -994,11 +1072,13 @@ def _run_review_in_thread(
                     _eff_ctx = _max_ctx if _max_ctx > 0 else 48000
                     _review_history, _digest_meta = _build_review_history(
                         messages_snapshot, _eff_ctx, _budget["digest_tail_messages"],
+                        use_prepass=_budget["prepass"],
+                        agent_runtime=agent._current_main_runtime(),
                     )
                     logger.info(
-                        "bg-review context: routed=%s digested=%s "
+                        "bg-review context: routed=%s digested=%s prepass=%s "
                         "full=%d→replayed=%d tokens (%d→%d msgs)",
-                        _routed, _digest_meta["digested"],
+                        _routed, _digest_meta["digested"], _digest_meta.get("prepass_used"),
                         _digest_meta["full_tokens"], _digest_meta["replayed_tokens"],
                         _digest_meta["full_messages"], _digest_meta["replayed_messages"],
                     )

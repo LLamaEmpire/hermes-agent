@@ -1557,6 +1557,18 @@ DEFAULT_CONFIG = {
             # engages — the turn(s) that triggered the review must survive
             # un-summarized so their signal isn't lost.
             "digest_tail_messages": 24,
+            # When true, before the (expensive) review fork runs, a cheap
+            # auxiliary call first scans the older/dropped turns and emits a
+            # ranked brief of candidate learnings (durable facts, corrections,
+            # techniques; flags retractions), prepended to the digest. This does
+            # the haystack search on a cheap model so the review fork judges a
+            # clean signal set — aimed at IMPROVING capture on long noisy
+            # sessions, not just bounding cost. Off by default (the lexical
+            # digest already preserves capture); turn on for very long sessions
+            # where attention dilution costs you saves. Falls back to the
+            # lexical digest if the pre-pass fails. Uses this same task's
+            # provider/model, so route it cheap above.
+            "prepass": False,
         },
     },
     
