@@ -778,3 +778,172 @@ class TestStatusLineSubgoalCount:
         mgr.add_subgoal("b")
         line = mgr.status_line()
         assert "2 subgoals" in line
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Wait barrier — parking the goal loop on a background process
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestWaitBarrier:
+    """The /goal wait barrier parks the loop on a live PID and resumes when
+    the process exits, without burning turns or calling the judge."""
+
+    @staticmethod
+    def _spawn_sleeper():
+        """Start a short-lived child process; return its Popen handle."""
+        import subprocess
+        import sys
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+
+    @staticmethod
+    def _dead_pid():
+        """A PID that is essentially guaranteed not to be running."""
+        return 2_000_000_000
+
+    def test_wait_on_requires_active_goal(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        mgr = GoalManager(session_id="wb-noactive")
+        with pytest.raises(RuntimeError):
+            mgr.wait_on(12345)
+
+    def test_wait_on_rejects_bad_pid(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        mgr = GoalManager(session_id="wb-badpid")
+        mgr.set("g")
+        with pytest.raises(ValueError):
+            mgr.wait_on(0)
+
+    def test_parked_on_live_pid_does_not_continue_or_judge(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        proc = self._spawn_sleeper()
+        try:
+            mgr = GoalManager(session_id="wb-live")
+            mgr.set("ship it", max_turns=5)
+            mgr.wait_on(proc.pid, reason="CI green")
+            assert mgr.is_waiting() is True
+
+            # The judge must NOT be called while parked, and no turn is burned.
+            judge = MagicMock(return_value=("continue", "x", False))
+            with patch.object(goals, "judge_goal", judge):
+                decision = mgr.evaluate_after_turn("still waiting on CI")
+
+            judge.assert_not_called()
+            assert decision["verdict"] == "waiting"
+            assert decision["should_continue"] is False
+            assert decision["continuation_prompt"] is None
+            assert mgr.state.turns_used == 0  # no turn consumed while parked
+            assert "CI green" in decision["message"]
+            assert mgr.state.status == "active"  # still active, just parked
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+
+    def test_barrier_auto_clears_when_process_exits_and_loop_resumes(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        proc = self._spawn_sleeper()
+        mgr = GoalManager(session_id="wb-exit")
+        mgr.set("ship it", max_turns=5)
+        mgr.wait_on(proc.pid, reason="build")
+        assert mgr.is_waiting() is True
+
+        # Kill the process — barrier should auto-clear and judging resumes.
+        proc.terminate()
+        proc.wait(timeout=10)
+
+        assert mgr.is_waiting() is False  # lazy auto-clear
+        assert mgr.state.waiting_on_pid is None
+
+        with patch.object(goals, "judge_goal", return_value=("continue", "more", False)):
+            decision = mgr.evaluate_after_turn("process finished, here are results")
+
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert mgr.state.turns_used == 1  # now a turn IS consumed
+
+    def test_dead_pid_never_parks(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="wb-dead")
+        mgr.set("g", max_turns=5)
+        mgr.wait_on(self._dead_pid(), reason="already-dead")
+        # is_waiting clears the stale barrier immediately.
+        assert mgr.is_waiting() is False
+
+        with patch.object(goals, "judge_goal", return_value=("continue", "go", False)):
+            decision = mgr.evaluate_after_turn("response")
+        assert decision["should_continue"] is True
+
+    def test_stop_waiting_clears_barrier(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        proc = self._spawn_sleeper()
+        try:
+            mgr = GoalManager(session_id="wb-stop")
+            mgr.set("g")
+            mgr.wait_on(proc.pid)
+            assert mgr.is_waiting() is True
+            assert mgr.stop_waiting() is True
+            assert mgr.state.waiting_on_pid is None
+            assert mgr.is_waiting() is False
+            assert mgr.stop_waiting() is False  # idempotent
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+
+    def test_pause_and_resume_clear_barrier(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        proc = self._spawn_sleeper()
+        try:
+            mgr = GoalManager(session_id="wb-pause")
+            mgr.set("g")
+            mgr.wait_on(proc.pid)
+            mgr.pause()
+            assert mgr.state.waiting_on_pid is None
+
+            mgr.resume()
+            assert mgr.state.waiting_on_pid is None
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+
+    def test_barrier_persists_and_reloads(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        proc = self._spawn_sleeper()
+        try:
+            mgr = GoalManager(session_id="wb-persist")
+            mgr.set("g")
+            mgr.wait_on(proc.pid, reason="deploy")
+
+            # Fresh manager loads the persisted barrier.
+            mgr2 = GoalManager(session_id="wb-persist")
+            assert mgr2.state.waiting_on_pid == proc.pid
+            assert mgr2.state.waiting_reason == "deploy"
+            assert mgr2.is_waiting() is True
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+
+    def test_old_state_row_loads_without_barrier_fields(self, hermes_home):
+        """Backwards-compat: a state_meta row written before the barrier
+        existed must load with no barrier."""
+        from hermes_cli.goals import GoalState
+
+        legacy = json.dumps({
+            "goal": "old goal",
+            "status": "active",
+            "turns_used": 2,
+            "max_turns": 20,
+        })
+        st = GoalState.from_json(legacy)
+        assert st.goal == "old goal"
+        assert st.waiting_on_pid is None
+        assert st.waiting_reason is None
+        assert st.waiting_since == 0.0

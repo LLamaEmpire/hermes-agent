@@ -44,6 +44,8 @@ What you'll see:
 | `/goal pause` | Stop the auto-continuation loop without clearing the goal. |
 | `/goal resume` | Resume the loop (resets the turn counter back to zero). |
 | `/goal clear` | Drop the goal entirely. |
+| `/goal wait <pid> [reason]` | Park the loop on a background process — it stops re-poking the agent every turn while the process runs, and auto-resumes when it exits. |
+| `/goal unwait` | Drop the wait barrier and resume the loop immediately. |
 
 Works identically on the CLI and every gateway platform (Telegram, Discord, Slack, Matrix, Signal, WhatsApp, SMS, iMessage, Webhook, API server, and the web dashboard).
 
@@ -61,6 +63,21 @@ While a goal is active you can append extra acceptance criteria with `/subgoal <
 Subgoals are persisted alongside the goal in `SessionDB.state_meta`, so they survive `/resume`. Setting a new `/goal <text>` replaces the goal and clears the subgoal list; `/goal clear` does the same.
 
 Use this when you start a loop ("fix the failing tests") and notice partway through that you also want it to "and add a regression test for the bug you just patched" — `/subgoal add a regression test` tightens the success criteria without breaking the running loop.
+
+## Parking on a background process: `/goal wait`
+
+Some goals are gated on something that takes minutes and runs on its own — CI on a pushed PR, a long build, a test matrix, a deploy. Without help, the goal loop would re-poke the agent every turn into "is it done yet?" busy-work while it waits.
+
+`/goal wait <pid> [reason]` **parks** the loop on a background process. While that PID is alive, the post-turn judge is skipped entirely — no turn is consumed, no continuation prompt is fired, and `/goal status` shows `⏳ Goal (parked on <reason>): <goal>`. The barrier **auto-clears the moment the process exits**, so the next turn resumes normal judging with the process's result in hand. Pair it with a `terminal(background=true, notify_on_complete=true)` watcher: the completion notification is what wakes the session, and by then the barrier is already lifted.
+
+| Command | What it does |
+|---|---|
+| `/goal wait <pid> [reason]` | Park the loop until the process with that PID exits. Requires an active goal. |
+| `/goal unwait` | Clear the barrier and resume immediately (e.g. you no longer care about that process). |
+
+The barrier is persisted with the goal in `SessionDB.state_meta`, so it survives `/resume`. `/goal pause`, `/goal resume`, and `/goal clear` all drop it. If the PID is already dead when you set it (or dies while parked), the barrier clears on the next check — a stale barrier can never wedge the loop.
+
+Typical flow: push a PR, start a CI watcher in the background, then `/goal wait <watcher-pid> CI green` — Hermes goes quiet instead of spinning, and picks back up the instant CI finishes.
 
 ## Behavior details
 
@@ -94,7 +111,7 @@ Any real message you send while a goal is active takes priority over the continu
 
 ### Mid-run safety (gateway)
 
-While an agent is already running, `/goal status`, `/goal pause`, and `/goal clear` are safe to run — they only touch control-plane state and don't interrupt the current turn. Setting a **new** goal mid-run (`/goal <new text>`) is rejected with a message telling you to `/stop` first, so the old continuation can't race the new one.
+While an agent is already running, `/goal status`, `/goal pause`, `/goal clear`, `/goal wait`, and `/goal unwait` are safe to run — they only touch control-plane state and don't interrupt the current turn. Setting a **new** goal mid-run (`/goal <new text>`) is rejected with a message telling you to `/stop` first, so the old continuation can't race the new one.
 
 ### Persistence
 

@@ -159,6 +159,19 @@ class GoalState:
     # them into the verdict. Backwards-compatible: defaults to empty so
     # old state_meta rows load unchanged.
     subgoals: List[str] = field(default_factory=list)
+    # Wait barrier: when the agent is blocked on a long-running background
+    # process (CI poller, build, test run, deploy) it can PARK the goal loop
+    # on that process's PID instead of being re-poked every turn into busy
+    # work. While ``waiting_on_pid`` is set AND that PID is still alive,
+    # ``evaluate_after_turn`` short-circuits to should_continue=False without
+    # burning a turn or calling the judge. The barrier auto-clears the moment
+    # the process exits, and the next turn resumes normal judging. Set via
+    # ``/goal wait <pid>`` (or ``hermes goal wait``); cleared by process exit,
+    # ``/goal unwait``, pause, resume, or clear. Backwards-compatible: old
+    # rows load with no barrier.
+    waiting_on_pid: Optional[int] = None
+    waiting_reason: Optional[str] = None
+    waiting_since: float = 0.0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -182,6 +195,9 @@ class GoalState:
             paused_reason=data.get("paused_reason"),
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
             subgoals=subgoals,
+            waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
+            waiting_reason=data.get("waiting_reason"),
+            waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
         )
 
     # --- subgoals helpers -------------------------------------------------
@@ -328,6 +344,45 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "… [truncated]"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if a process with ``pid`` is currently alive.
+
+    Cross-platform: prefers ``psutil`` when available (handles Windows and
+    avoids the zombie-counts-as-alive quirk), falls back to POSIX
+    ``os.kill(pid, 0)``. Any error resolves to False (treat unknown as dead)
+    so a stale barrier never wedges the loop — the worst case is the goal
+    resumes one turn early, which is safe.
+    """
+    if not pid or pid <= 0:
+        return False
+    try:
+        import psutil  # type: ignore
+
+        if not psutil.pid_exists(pid):
+            return False
+        try:
+            proc = psutil.Process(pid)
+            # A zombie/dead process is effectively done — treat as not alive.
+            return proc.status() != psutil.STATUS_ZOMBIE
+        except Exception:
+            return False
+    except Exception:
+        pass
+    # Fallback: POSIX signal-0 liveness probe.
+    try:
+        import os
+
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by another user — alive for our purposes.
+        return True
+    except Exception:
+        return False
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
@@ -547,6 +602,9 @@ class GoalManager:
         turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         if s.status == "active":
+            if s.waiting_on_pid and _pid_alive(s.waiting_on_pid):
+                wr = s.waiting_reason or f"pid {s.waiting_on_pid}"
+                return f"⏳ Goal (parked on {wr}, {turns}{sub}): {s.goal}"
             return f"⊙ Goal (active, {turns}{sub}): {s.goal}"
         if s.status == "paused":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
@@ -578,6 +636,10 @@ class GoalManager:
             return None
         self._state.status = "paused"
         self._state.paused_reason = reason
+        # A wait barrier is meaningless once paused — drop it.
+        self._state.waiting_on_pid = None
+        self._state.waiting_reason = None
+        self._state.waiting_since = 0.0
         save_goal(self.session_id, self._state)
         return self._state
 
@@ -586,6 +648,10 @@ class GoalManager:
             return None
         self._state.status = "active"
         self._state.paused_reason = None
+        # Resuming starts fresh — clear any stale barrier.
+        self._state.waiting_on_pid = None
+        self._state.waiting_reason = None
+        self._state.waiting_since = 0.0
         if reset_budget:
             self._state.turns_used = 0
         save_goal(self.session_id, self._state)
@@ -653,6 +719,54 @@ class GoalManager:
             return "(no subgoals — use /subgoal <text> to add criteria)"
         return self._state.render_subgoals_block()
 
+    # --- /goal wait barrier -------------------------------------------
+
+    def wait_on(self, pid: int, reason: str = "") -> GoalState:
+        """Park the goal loop on a background process PID.
+
+        While the PID is alive, ``evaluate_after_turn`` returns
+        ``should_continue=False`` without burning a turn or calling the
+        judge — the loop quiesces instead of re-poking the agent into busy
+        work. The barrier auto-clears when the process exits (the agent's
+        ``notify_on_complete`` background watcher is the natural wake
+        signal). Requires an active goal.
+        """
+        if self._state is None or self._state.status != "active":
+            raise RuntimeError("no active goal to park")
+        pid = int(pid)
+        if pid <= 0:
+            raise ValueError("pid must be a positive integer")
+        self._state.waiting_on_pid = pid
+        self._state.waiting_reason = (reason or "").strip() or None
+        self._state.waiting_since = time.time()
+        save_goal(self.session_id, self._state)
+        return self._state
+
+    def stop_waiting(self) -> bool:
+        """Clear any active wait barrier. Returns True if one was cleared."""
+        if self._state is None or self._state.waiting_on_pid is None:
+            return False
+        self._state.waiting_on_pid = None
+        self._state.waiting_reason = None
+        self._state.waiting_since = 0.0
+        save_goal(self.session_id, self._state)
+        return True
+
+    def is_waiting(self) -> bool:
+        """True iff a barrier is set AND its process is still alive.
+
+        Side effect: if the barrier is set but the process has exited, the
+        barrier is cleared here (lazy auto-clear) so the next evaluation
+        resumes normal judging.
+        """
+        if self._state is None or self._state.waiting_on_pid is None:
+            return False
+        if _pid_alive(self._state.waiting_on_pid):
+            return True
+        # Process gone — auto-clear the barrier.
+        self.stop_waiting()
+        return False
+
     # --- the main entry point called after every turn -----------------
 
     def evaluate_after_turn(
@@ -684,6 +798,21 @@ class GoalManager:
                 "verdict": "inactive",
                 "reason": "no active goal",
                 "message": "",
+            }
+
+        # Wait barrier: if the loop is parked on a background process that's
+        # still alive, quiesce — do NOT burn a turn or call the judge. The
+        # agent stays idle until the process exits (its notify_on_complete
+        # watcher wakes the session), then the next turn resumes judging.
+        if self.is_waiting():
+            reason = state.waiting_reason or f"pid {state.waiting_on_pid}"
+            return {
+                "status": "active",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "waiting",
+                "reason": reason,
+                "message": f"⏳ Goal parked — waiting on {reason} (pid {state.waiting_on_pid}).",
             }
 
         # Count the turn that just finished.
