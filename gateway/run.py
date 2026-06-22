@@ -2725,6 +2725,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
 
+        # HRM-T0a: wire the JSON registry checker so /topic switch / new / move
+        # can validate topic registration.  Wired only when pointer mode is
+        # enabled AND a default_app_id is configured; otherwise the existing
+        # fail-closed (no checker = reject all) behaviour is preserved.
+        if (
+            getattr(self.config, "topic_pointer_mode_enabled", False)
+            and getattr(self.config, "topic_default_app_id", None)
+        ):
+            try:
+                from pathlib import Path as _Path
+                from hermes_cli.config import get_hermes_home as _get_hermes_home
+                from gateway.topic_registry import make_json_registry_checker as _make_checker
+                from gateway.active_topic import set_registered_check as _set_check
+                _registry_root = (
+                    _Path(self.config.topic_registry_root)
+                    if getattr(self.config, "topic_registry_root", None)
+                    else _get_hermes_home() / "registry"
+                )
+                _checker = _make_checker(
+                    registry_root=_registry_root,
+                    app_id=self.config.topic_default_app_id,
+                )
+                _set_check(_checker)
+                logger.info(
+                    "HRM-T0a: topic registry checker wired (app_id=%r, registry_root=%s)",
+                    self.config.topic_default_app_id,
+                    _registry_root,
+                )
+            except Exception as _exc:
+                logger.warning(
+                    "HRM-T0a: topic registry checker wiring failed: %s"
+                    " — topic routing remains fail-closed",
+                    _exc,
+                )
+
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
         # checkpoints.auto_prune, idempotent via .last_prune marker.
