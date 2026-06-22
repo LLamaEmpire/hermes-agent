@@ -2871,6 +2871,10 @@ class GatewaySlashCommandsMixin:
             "  /topic clear          clear active topic\n"
             "  /topic bind-thread    bind current thread to active topic\n"
             "  /topic unbind-thread  clear thread binding on active topic\n"
+            "  /topic move-last <N> --to <slug> [--dry-run] [--idempotency-key <k>]\n"
+            "                        move the last N turns from active topic into <slug>\n"
+            "  /topic move-range <A..B> --to <slug> [--dry-run] [--idempotency-key <k>]\n"
+            "                        move messages id A..B from active topic into <slug>\n"
             "  /topic help           this text"
         )
 
@@ -2927,6 +2931,14 @@ class GatewaySlashCommandsMixin:
             return await self._handle_topic_subcommand_bind_thread(source, principal)
         if sub == "unbind-thread":
             return await self._handle_topic_subcommand_unbind_thread(source, principal)
+        if sub == "move-last":
+            return await self._handle_topic_subcommand_move_last(
+                source, principal, rest
+            )
+        if sub == "move-range":
+            return await self._handle_topic_subcommand_move_range(
+                source, principal, rest
+            )
         return (
             f"/topic: unknown subcommand {sub!r}. "
             f"Try `/topic help`."
@@ -3104,6 +3116,341 @@ class GatewaySlashCommandsMixin:
                 f"error: {exc}); pointer rolled back."
             )
         return ""
+
+    # ── HRM-T0a step 7: /topic move-last + move-range ──────────────────
+
+    @staticmethod
+    def _parse_topic_move_kv_flags(
+        tokens: list,
+    ) -> tuple[Optional[str], Optional[str], bool, Optional[str]]:
+        """Pull flags shared by move-last and move-range from a token list.
+
+        Recognises ``--to <slug>``, ``to:<slug>``, ``--dry-run`` /
+        ``--dry`` (boolean), ``--idempotency-key <k>`` / ``--key <k>`` /
+        ``key:<k>``. Returns ``(dst_slug, idempotency_key, dry_run, error)``;
+        ``error`` is None on success, else a user-visible string explaining
+        the parse failure. Positional tokens that are NOT flags are
+        ignored here — callers consume the leading positional (count or
+        range) themselves before passing the remainder in.
+        """
+        dst_slug: Optional[str] = None
+        idempotency_key: Optional[str] = None
+        dry_run = False
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            tl = tok.lower()
+            if tl in {"--to", "-t"}:
+                if i + 1 >= len(tokens):
+                    return None, None, False, f"{tok}: missing value"
+                dst_slug = tokens[i + 1]
+                i += 2
+                continue
+            if tl.startswith("to:"):
+                dst_slug = tok[3:]
+                i += 1
+                continue
+            if tl.startswith("--to="):
+                dst_slug = tok[len("--to="):]
+                i += 1
+                continue
+            if tl in {"--dry-run", "--dry"}:
+                dry_run = True
+                i += 1
+                continue
+            if tl in {"--idempotency-key", "--key", "-k"}:
+                if i + 1 >= len(tokens):
+                    return None, None, False, f"{tok}: missing value"
+                idempotency_key = tokens[i + 1]
+                i += 2
+                continue
+            if tl.startswith("--idempotency-key="):
+                idempotency_key = tok[len("--idempotency-key="):]
+                i += 1
+                continue
+            if tl.startswith("key:"):
+                idempotency_key = tok[4:]
+                i += 1
+                continue
+            # Unknown token — surface so the user knows the slash didn't
+            # silently drop a flag they meant.
+            return None, None, False, f"unrecognised arg {tok!r}"
+        return dst_slug, idempotency_key, dry_run, None
+
+    def _resolve_topic_move_session_ids(
+        self, source, principal, src_topic_id: str, dst_topic_id: str
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Resolve (src_session_id, dst_session_id, error).
+
+        Looks both sessions up in the gateway's :class:`SessionStore`
+        keyed by the deterministic ``build_topic_session_key`` (the same
+        key the inbound routing pre-pass uses). The src session must
+        already exist — if it doesn't, the user has nothing to move.
+        The dst session is created on demand because the caller has
+        already verified ``assert_registered(app_id, dst_topic_id)``
+        before reaching here, so materialising an empty session is
+        the natural cost of a valid recovery command.
+        """
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return None, None, (
+                "/topic move: session store unavailable — refusing move"
+            )
+        from gateway.active_topic import build_topic_session_key
+        profile = getattr(self.config, "agent_profile", None)
+        try:
+            src_key = build_topic_session_key(
+                principal, topic_id=src_topic_id, profile=profile
+            )
+            dst_key = build_topic_session_key(
+                principal, topic_id=dst_topic_id, profile=profile
+            )
+        except ValueError as exc:
+            return None, None, f"/topic move: invalid topic key: {exc}"
+
+        entries = getattr(store, "_entries", {}) or {}
+        src_entry = entries.get(src_key)
+        if src_entry is None or not getattr(src_entry, "session_id", None):
+            return None, None, (
+                f"/topic move: no session for active topic "
+                f"{src_topic_id!r} yet — send a message first"
+            )
+
+        dst_entry = entries.get(dst_key)
+        if dst_entry is None or not getattr(dst_entry, "session_id", None):
+            # Create-on-demand: dst slug already passed registry; an
+            # empty session is the legitimate landing pad for moved turns.
+            try:
+                dst_entry = store.get_or_create_session(
+                    source, _session_key=dst_key
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                return None, None, (
+                    f"/topic move: failed to materialise dst session "
+                    f"{dst_topic_id!r}: {exc}"
+                )
+            if dst_entry is None or not getattr(dst_entry, "session_id", None):
+                return None, None, (
+                    f"/topic move: dst session not materialised for "
+                    f"topic {dst_topic_id!r}"
+                )
+        return src_entry.session_id, dst_entry.session_id, None
+
+    async def _execute_topic_move(
+        self,
+        source,
+        principal,
+        *,
+        range_spec: str,
+        dst_slug_raw: str,
+        idempotency_key: Optional[str],
+        dry_run: bool,
+    ) -> str:
+        """Shared move executor used by move-last and move-range.
+
+        Slash UX is a thin call into ``SessionDB.move_turns`` — the same
+        primitive the API server's ``POST /api/sessions/{id}/move/{...}``
+        endpoints use. Validation order mirrors the API handlers so the
+        user-visible error names line up across surfaces.
+        """
+        from gateway.active_topic import (
+            TopicNotRegisteredError,
+            assert_registered,
+            read_active_topic,
+        )
+
+        # 1) Validate dst slug shape (same regex as switch).
+        dst_slug = (dst_slug_raw or "").strip().lower()
+        if not dst_slug:
+            return "/topic move: --to <slug> is required"
+        if not self._TOPIC_ID_RE.match(dst_slug):
+            return (
+                f"/topic move: {dst_slug_raw!r} is not a valid topic slug "
+                f"(use lowercase alphanumerics, _ or -, ≤64 chars)"
+            )
+
+        # 2) Idempotency-key contract: required on commit, validated shape.
+        if idempotency_key is not None:
+            if not idempotency_key or len(idempotency_key) > 256:
+                return (
+                    "/topic move: --idempotency-key must be a non-empty "
+                    "string ≤256 chars"
+                )
+            if re.search(r"[\r\n\x00]", idempotency_key):
+                return (
+                    "/topic move: --idempotency-key must not contain "
+                    "control characters"
+                )
+        if not dry_run and not idempotency_key:
+            return (
+                "/topic move: --idempotency-key required for commit "
+                "(or pass --dry-run to plan)"
+            )
+
+        # 3) Read active topic → that's our source.
+        prior = await read_active_topic(self._session_db, principal)
+        if not prior or not prior.get("topic_id"):
+            return (
+                "/topic move: no active topic — `/topic switch <slug>` "
+                "first, then re-run the move."
+            )
+        src_topic_id = str(prior["topic_id"])
+        if src_topic_id == dst_slug:
+            return (
+                f"/topic move: destination must differ from current "
+                f"topic ({src_topic_id!r})"
+            )
+
+        # 4) Verify dst topic is registered under this principal's app.
+        try:
+            await assert_registered(principal.app_id, dst_slug)
+        except TopicNotRegisteredError as exc:
+            return (
+                f"/topic move: refused — topic {dst_slug!r} is not "
+                f"registered under app {principal.app_id!r} ({exc})"
+            )
+
+        # 5) Resolve src / dst session_ids.
+        src_session_id, dst_session_id, err = self._resolve_topic_move_session_ids(
+            source, principal, src_topic_id, dst_slug
+        )
+        if err is not None:
+            return err
+
+        # 6) Call the primitive directly — same contract as API endpoints.
+        try:
+            result = await asyncio.to_thread(
+                self._session_db.move_turns,
+                src_session_id=src_session_id,
+                dst_session_id=dst_session_id,
+                range_spec=range_spec,
+                idempotency_key=idempotency_key,
+                dry_run=dry_run,
+            )
+        except KeyError as exc:
+            msg = str(exc).strip("'\"")
+            return f"/topic move: session not found ({msg})"
+        except ValueError as exc:
+            return f"/topic move: invalid request ({exc})"
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.exception(
+                "/topic move primitive failed: src=%s dst=%s range=%s",
+                src_session_id, dst_session_id, range_spec,
+            )
+            return f"/topic move: failed: {exc}"
+
+        moved_count = len(result.get("src_message_ids") or [])
+        if dry_run:
+            return (
+                f"[topic move dry-run] {range_spec}: {moved_count} turn(s) "
+                f"would move from {src_topic_id!r} → {dst_slug!r}"
+            )
+
+        replay = bool(result.get("replay"))
+        banner = (
+            f"[topic move → {dst_slug}] {moved_count} turn(s) moved"
+            + (" (replay)" if replay else "")
+        )
+        try:
+            await self._emit_topic_pointer_banner(source, banner)
+        except Exception as exc:
+            # Move commits are NOT rolled back on banner failure — the
+            # primitive's idempotency_key is the recovery story (replay
+            # returns byte-equal). Surface the banner-emit failure visibly
+            # so the user knows the move landed but the confirmation
+            # didn't reach the surface.
+            logger.warning(
+                "/topic move banner emit failed (move already committed): %s",
+                exc,
+            )
+            return (
+                f"/topic move: committed {moved_count} turn(s) from "
+                f"{src_topic_id!r} → {dst_slug!r}, but banner emit "
+                f"error: {exc}. Replay with the same idempotency_key is "
+                f"safe."
+            )
+        return ""
+
+    async def _handle_topic_subcommand_move_last(
+        self, source, principal, args: list
+    ) -> str:
+        if not args:
+            return "/topic move-last <N> --to <slug> — missing N"
+        raw_n = args[0]
+        # Refuse if the positional slot is actually a flag — the user
+        # forgot the count.
+        if raw_n.startswith("-") and not raw_n.lstrip("-").isdigit():
+            return "/topic move-last <N> --to <slug> — missing N"
+        if ":" in raw_n and not raw_n.lstrip("-").isdigit():
+            return "/topic move-last <N> --to <slug> — missing N"
+        try:
+            count = int(raw_n)
+        except (TypeError, ValueError):
+            return f"/topic move-last: invalid count {raw_n!r} (expected int)"
+        if count < 1:
+            return f"/topic move-last: count must be >= 1 (got {count})"
+        dst_slug, idem_key, dry_run, parse_err = self._parse_topic_move_kv_flags(
+            args[1:]
+        )
+        if parse_err is not None:
+            return f"/topic move-last: {parse_err}"
+        if not dst_slug:
+            return "/topic move-last: --to <slug> is required"
+        return await self._execute_topic_move(
+            source, principal,
+            range_spec=f"last:{count}",
+            dst_slug_raw=dst_slug,
+            idempotency_key=idem_key,
+            dry_run=dry_run,
+        )
+
+    async def _handle_topic_subcommand_move_range(
+        self, source, principal, args: list
+    ) -> str:
+        if not args:
+            return "/topic move-range <A..B> --to <slug> — missing range"
+        raw_range = args[0]
+        # Refuse if the positional slot is actually a flag.
+        if raw_range.startswith("-"):
+            return "/topic move-range <A..B> --to <slug> — missing range"
+        if ".." not in raw_range:
+            return (
+                f"/topic move-range: invalid range {raw_range!r} "
+                f"(expected A..B)"
+            )
+        a_str, _, b_str = raw_range.partition("..")
+        try:
+            from_id = int(a_str)
+            to_id = int(b_str)
+        except (TypeError, ValueError):
+            return (
+                f"/topic move-range: invalid range {raw_range!r} "
+                f"(A and B must be integers)"
+            )
+        if from_id < 1 or to_id < 1:
+            return (
+                f"/topic move-range: range bounds must be positive "
+                f"(got {from_id}..{to_id})"
+            )
+        if from_id > to_id:
+            return (
+                f"/topic move-range: from_id must be <= to_id "
+                f"(got {from_id}..{to_id})"
+            )
+        dst_slug, idem_key, dry_run, parse_err = self._parse_topic_move_kv_flags(
+            args[1:]
+        )
+        if parse_err is not None:
+            return f"/topic move-range: {parse_err}"
+        if not dst_slug:
+            return "/topic move-range: --to <slug> is required"
+        return await self._execute_topic_move(
+            source, principal,
+            range_spec=f"range:{from_id}..{to_id}",
+            dst_slug_raw=dst_slug,
+            idempotency_key=idem_key,
+            dry_run=dry_run,
+        )
 
     async def _handle_topic_command(self, event: MessageEvent, args: str = "") -> str:
         """Handle /topic.
