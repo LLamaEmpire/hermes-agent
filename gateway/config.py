@@ -1268,6 +1268,30 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
                 )
                 pconfig.enabled = False
 
+    # HRM-T0a step 10: validate the API server's enablement posture
+    # (default-deny + safe key/bind/TLS/Tailscale posture). When the platform
+    # is declared but the posture is unsafe, force enabled=False so the
+    # gateway runner never even attempts to bind — matching the existing
+    # "weak token → disable platform" pattern above and giving operators a
+    # clear startup error instead of a delayed connect()-time refusal.
+    api_server_cfg = config.platforms.get(Platform.API_SERVER)
+    if api_server_cfg is not None and api_server_cfg.enabled:
+        try:
+            from gateway.platforms.api_server import validate_api_server_posture
+        except ImportError:
+            validate_api_server_posture = None  # type: ignore[assignment]
+        if validate_api_server_posture is not None:
+            ok, reason = validate_api_server_posture(
+                api_server_cfg.extra, enabled=True,
+            )
+            if not ok:
+                logger.error(
+                    "api_server is enabled but the configured posture is "
+                    "unsafe: %s The adapter will NOT be started.",
+                    reason,
+                )
+                api_server_cfg.enabled = False
+
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""

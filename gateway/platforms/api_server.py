@@ -370,6 +370,101 @@ def check_api_server_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+# ---------------------------------------------------------------------------
+# Enablement posture validator (HRM-T0a step 10)
+# ---------------------------------------------------------------------------
+#
+# The API server is default-deny: if no platform block exists in config.yaml,
+# or the block has ``enabled: false``, the adapter is never constructed and
+# nothing binds. When ``enabled: true``, the operator must declare a safe
+# auth+bind posture before the gateway will start the server.
+#
+# The posture rules below are checked at TWO surfaces:
+# (a) config-load (``_validate_gateway_config`` in gateway/config.py) —
+#     fail-fast at startup so a bad config never even constructs the adapter;
+# (b) ``connect()`` — defense-in-depth, in case the platform was enabled by
+#     a code path that bypassed the loader (env override, dashboard PUT).
+#
+# Rules:
+#   1. ``key`` (API_SERVER_KEY) must be present and pass ``has_usable_secret``.
+#      No exception for loopback: bearer auth is the trust boundary, not the
+#      bind address.
+#   2. When the bind is network-accessible (anything other than loopback),
+#      the key must be strong (>= 16 chars, matching the 0day hardening) AND
+#      the operator must declare ONE OF:
+#        - ``tls: true``      — TLS terminated upstream (e.g. reverse proxy)
+#        - ``tailscale_only: true`` — bind is on a Tailscale interface
+#      A plaintext public bind, even with a strong key, is refused.
+
+_API_SERVER_POSTURE_KEY_MIN_LEN_NETWORK = 16
+_API_SERVER_POSTURE_KEY_MIN_LEN_LOOPBACK = 4
+
+
+def validate_api_server_posture(
+    extra: Optional[Dict[str, Any]],
+    *,
+    enabled: bool = True,
+) -> tuple[bool, Optional[str]]:
+    """Validate the API server's enablement posture.
+
+    Returns ``(True, None)`` when safe to start, or ``(False, reason)`` when
+    the posture is unsafe.  ``enabled=False`` short-circuits to ``(True, None)``
+    so callers can pass through the platform's own enabled flag and treat
+    "not enabled" as the default-deny no-op.
+
+    ``extra`` is the platform's extra dict (``host``, ``port``, ``key``,
+    ``tls``, ``tailscale_only``). ``None`` is treated as ``{}``.
+    """
+    if not enabled:
+        return True, None
+
+    extra = extra or {}
+    host = str(extra.get("host", DEFAULT_HOST) or DEFAULT_HOST)
+    key = str(extra.get("key", "") or "")
+    tls = bool(extra.get("tls", False))
+    tailscale_only = bool(extra.get("tailscale_only", False))
+
+    network_accessible = is_network_accessible(host)
+    min_len = (
+        _API_SERVER_POSTURE_KEY_MIN_LEN_NETWORK
+        if network_accessible
+        else _API_SERVER_POSTURE_KEY_MIN_LEN_LOOPBACK
+    )
+
+    try:
+        from hermes_cli.auth import has_usable_secret
+    except ImportError:
+        has_usable_secret = None  # type: ignore[assignment]
+
+    if has_usable_secret is not None:
+        usable = has_usable_secret(key, min_length=min_len)
+    else:
+        usable = bool(key) and len(key.strip()) >= min_len
+
+    if not usable:
+        if not key:
+            return False, (
+                "API_SERVER_KEY is required to enable the API server. "
+                "Bearer auth is the trust boundary on every bind, including "
+                "loopback."
+            )
+        return False, (
+            f"API_SERVER_KEY is too short or a placeholder for bind {host!r} "
+            f"(min {min_len} chars; non-loopback binds require a strong "
+            "secret — generate one with `openssl rand -hex 32`)."
+        )
+
+    if network_accessible and not (tls or tailscale_only):
+        return False, (
+            f"API server bound to non-loopback host {host!r} must declare a "
+            "safe transport posture: set platforms.api_server.extra.tls: true "
+            "(TLS terminated upstream) or platforms.api_server.extra."
+            "tailscale_only: true (bind is on a Tailscale interface)."
+        )
+
+    return True, None
+
+
 class ResponseStore:
     """
     SQLite-backed LRU store for Responses API state.
@@ -4711,38 +4806,25 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
-            # Refuse to start without authentication. The API server can
-            # dispatch terminal-capable agent work, so every deployment needs
-            # an explicit API_SERVER_KEY regardless of bind address.
-            if not self._api_key:
+            # HRM-T0a step 10 posture validator: refuse to start unless the
+            # configured auth + bind posture is safe (default-deny). Covers
+            # the legacy openclaw#64586 + 0day-hardening checks (key required,
+            # >=16 chars on non-loopback) and adds the TLS-or-Tailscale-only
+            # requirement for non-loopback binds.
+            posture_extra = {
+                "host": self._host,
+                "key": self._api_key,
+                "tls": bool((self.config.extra or {}).get("tls", False)),
+                "tailscale_only": bool(
+                    (self.config.extra or {}).get("tailscale_only", False)
+                ),
+            }
+            ok, reason = validate_api_server_posture(posture_extra, enabled=True)
+            if not ok:
                 logger.error(
-                    "[%s] Refusing to start: API_SERVER_KEY is required for the API server, "
-                    "including loopback-only binds on %s.",
-                    self.name, self._host,
+                    "[%s] Refusing to start API server: %s", self.name, reason,
                 )
                 return False
-
-            # Refuse to start network-accessible with a placeholder or weak key.
-            # Ported from openclaw/openclaw#64586; entropy floor raised to 16 in
-            # the June 2026 hermes-0day hardening (an 8-char key dispatching
-            # terminal-capable agent work on a public bind is brute-forceable).
-            if is_network_accessible(self._host) and self._api_key:
-                try:
-                    from hermes_cli.auth import has_usable_secret
-                    if not has_usable_secret(self._api_key, min_length=16):
-                        logger.error(
-                            "[%s] Refusing to start: API_SERVER_KEY is a "
-                            "placeholder or too short (<16 chars) for a "
-                            "network-accessible bind. This endpoint dispatches "
-                            "terminal-capable agent work — a guessable key is "
-                            "remote code execution. Generate a strong secret "
-                            "(e.g. `openssl rand -hex 32`) and set "
-                            "API_SERVER_KEY before exposing it on %s.",
-                            self.name, self._host,
-                        )
-                        return False
-                except ImportError:
-                    pass
 
             # Loud warning when a network-accessible API server runs against an
             # unsandboxed local terminal backend. The API server can drive the

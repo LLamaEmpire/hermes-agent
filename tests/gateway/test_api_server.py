@@ -2529,7 +2529,11 @@ class TestConfigIntegration:
         assert Platform.API_SERVER.value == "api_server"
 
     def test_env_override_enables_api_server(self, monkeypatch):
+        # HRM-T0a step 10: enablement now requires a usable API_SERVER_KEY
+        # (default-deny posture). Setting only API_SERVER_ENABLED creates
+        # the platform block but the posture validator force-disables it.
         monkeypatch.setenv("API_SERVER_ENABLED", "true")
+        monkeypatch.setenv("API_SERVER_KEY", "x" * 32)
         from gateway.config import load_gateway_config
         config = load_gateway_config()
         assert Platform.API_SERVER in config.platforms
