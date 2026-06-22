@@ -167,19 +167,69 @@ class TestValidatorNetworkAccessible:
         assert ok is False
         assert reason is not None
 
-    def test_truthy_non_bool_tls_value_does_not_satisfy(self):
-        """Only explicit True (or another truthy bool-ish) lifts the gate."""
+    def test_explicit_true_lifts_the_gate(self):
+        """Only the real YAML boolean ``true`` satisfies the transport gate."""
         ok, _ = validate_api_server_posture(
             {"host": "0.0.0.0", "key": _STRONG_KEY, "tls": True},
         )
         assert ok is True
-        # ``"false"`` string would coerce to truthy under bool() — verify we
-        # accept it as truthy intentionally (operator wrote a value), so this
-        # is documented behaviour rather than a silent bypass.
-        ok2, _ = validate_api_server_posture(
-            {"host": "0.0.0.0", "key": _STRONG_KEY, "tls": "yes"},
+
+    @pytest.mark.parametrize(
+        "tls_value",
+        ["yes", "true", "True", "1", "on", "false", "False", "no", "off"],
+    )
+    def test_non_bool_string_tls_rejected(self, tls_value):
+        """Quoted YAML scalars must NEVER satisfy the transport gate.
+
+        ``bool("false")`` is True under Python truthiness, so accepting
+        non-bool ``tls`` values would let a config-file typo silently lift
+        the posture gate on a network-accessible bind.
+        """
+        ok, reason = validate_api_server_posture(
+            {"host": "0.0.0.0", "key": _STRONG_KEY, "tls": tls_value},
         )
-        assert ok2 is True
+        assert ok is False
+        assert reason is not None
+        assert "tls" in reason.lower() and "boolean" in reason.lower()
+
+    @pytest.mark.parametrize(
+        "tailscale_value",
+        ["yes", "true", "True", "1", "on", "false", "False", "no", "off"],
+    )
+    def test_non_bool_string_tailscale_only_rejected(self, tailscale_value):
+        """Same strict-bool rule applies to ``tailscale_only``."""
+        ok, reason = validate_api_server_posture(
+            {
+                "host": "0.0.0.0",
+                "key": _STRONG_KEY,
+                "tailscale_only": tailscale_value,
+            },
+        )
+        assert ok is False
+        assert reason is not None
+        assert "tailscale_only" in reason.lower() and "boolean" in reason.lower()
+
+    @pytest.mark.parametrize("bad_value", [1, 0, 1.0, ["true"], {"v": True}])
+    def test_non_bool_non_string_tls_rejected(self, bad_value):
+        """Numbers, lists, and dicts are also rejected — strict bool only."""
+        ok, reason = validate_api_server_posture(
+            {"host": "0.0.0.0", "key": _STRONG_KEY, "tls": bad_value},
+        )
+        assert ok is False
+        assert reason is not None
+        assert "boolean" in reason.lower()
+
+    def test_explicit_false_tls_still_falls_back_to_transport_error(self):
+        """``tls: false`` is a valid bool — gate stays closed via the
+        normal transport-required failure, not the type-rejection branch."""
+        ok, reason = validate_api_server_posture(
+            {"host": "0.0.0.0", "key": _STRONG_KEY, "tls": False},
+        )
+        assert ok is False
+        assert reason is not None
+        # Falls through to the transport-posture failure, not the type check.
+        assert "boolean" not in reason.lower()
+        assert "tls" in reason.lower() or "tailscale" in reason.lower()
 
 
 # ---------------------------------------------------------------------------

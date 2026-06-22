@@ -421,8 +421,23 @@ def validate_api_server_posture(
     extra = extra or {}
     host = str(extra.get("host", DEFAULT_HOST) or DEFAULT_HOST)
     key = str(extra.get("key", "") or "")
-    tls = bool(extra.get("tls", False))
-    tailscale_only = bool(extra.get("tailscale_only", False))
+    # Posture flags MUST be real YAML booleans. ``bool("false")`` is True
+    # under Python truthiness, so a quoted scalar in config.yaml
+    # (``tls: "false"``, ``tls: "yes"``, ``tailscale_only: "off"``) would
+    # silently lift the gate. Reject anything that is not a real bool so a
+    # typo can never satisfy the transport-posture requirement.
+    tls_raw = extra.get("tls", False)
+    tailscale_only_raw = extra.get("tailscale_only", False)
+    for name, raw in (("tls", tls_raw), ("tailscale_only", tailscale_only_raw)):
+        if raw is not None and not isinstance(raw, bool):
+            return False, (
+                f"platforms.api_server.extra.{name} must be a YAML boolean "
+                f"(true/false), got {type(raw).__name__} {raw!r}. Quoted "
+                "strings like \"true\"/\"false\"/\"yes\" are rejected so a "
+                "typo can never silently lift the posture gate."
+            )
+    tls = tls_raw is True
+    tailscale_only = tailscale_only_raw is True
 
     network_accessible = is_network_accessible(host)
     min_len = (
