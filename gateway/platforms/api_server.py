@@ -13,6 +13,8 @@ Exposes an HTTP server with endpoints:
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
+- POST /api/sessions/{session_id}/move/last  — move the last N turns to another session
+- POST /api/sessions/{session_id}/move/range — move messages.id A..B to another session
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
@@ -366,6 +368,116 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Enablement posture validator (HRM-T0a step 10)
+# ---------------------------------------------------------------------------
+#
+# The API server is default-deny: if no platform block exists in config.yaml,
+# or the block has ``enabled: false``, the adapter is never constructed and
+# nothing binds. When ``enabled: true``, the operator must declare a safe
+# auth+bind posture before the gateway will start the server.
+#
+# The posture rules below are checked at TWO surfaces:
+# (a) config-load (``_validate_gateway_config`` in gateway/config.py) —
+#     fail-fast at startup so a bad config never even constructs the adapter;
+# (b) ``connect()`` — defense-in-depth, in case the platform was enabled by
+#     a code path that bypassed the loader (env override, dashboard PUT).
+#
+# Rules:
+#   1. ``key`` (API_SERVER_KEY) must be present and pass ``has_usable_secret``.
+#      No exception for loopback: bearer auth is the trust boundary, not the
+#      bind address.
+#   2. When the bind is network-accessible (anything other than loopback),
+#      the key must be strong (>= 16 chars, matching the 0day hardening) AND
+#      the operator must declare ONE OF:
+#        - ``tls: true``      — TLS terminated upstream (e.g. reverse proxy)
+#        - ``tailscale_only: true`` — bind is on a Tailscale interface
+#      A plaintext public bind, even with a strong key, is refused.
+
+_API_SERVER_POSTURE_KEY_MIN_LEN_NETWORK = 16
+_API_SERVER_POSTURE_KEY_MIN_LEN_LOOPBACK = 4
+
+
+def validate_api_server_posture(
+    extra: Optional[Dict[str, Any]],
+    *,
+    enabled: bool = True,
+) -> tuple[bool, Optional[str]]:
+    """Validate the API server's enablement posture.
+
+    Returns ``(True, None)`` when safe to start, or ``(False, reason)`` when
+    the posture is unsafe.  ``enabled=False`` short-circuits to ``(True, None)``
+    so callers can pass through the platform's own enabled flag and treat
+    "not enabled" as the default-deny no-op.
+
+    ``extra`` is the platform's extra dict (``host``, ``port``, ``key``,
+    ``tls``, ``tailscale_only``). ``None`` is treated as ``{}``.
+    """
+    if not enabled:
+        return True, None
+
+    extra = extra or {}
+    host = str(extra.get("host", DEFAULT_HOST) or DEFAULT_HOST)
+    key = str(extra.get("key", "") or "")
+    # Posture flags MUST be real YAML booleans. ``bool("false")`` is True
+    # under Python truthiness, so a quoted scalar in config.yaml
+    # (``tls: "false"``, ``tls: "yes"``, ``tailscale_only: "off"``) would
+    # silently lift the gate. Reject anything that is not a real bool so a
+    # typo can never satisfy the transport-posture requirement.
+    tls_raw = extra.get("tls", False)
+    tailscale_only_raw = extra.get("tailscale_only", False)
+    for name, raw in (("tls", tls_raw), ("tailscale_only", tailscale_only_raw)):
+        if raw is not None and not isinstance(raw, bool):
+            return False, (
+                f"platforms.api_server.extra.{name} must be a YAML boolean "
+                f"(true/false), got {type(raw).__name__} {raw!r}. Quoted "
+                "strings like \"true\"/\"false\"/\"yes\" are rejected so a "
+                "typo can never silently lift the posture gate."
+            )
+    tls = tls_raw is True
+    tailscale_only = tailscale_only_raw is True
+
+    network_accessible = is_network_accessible(host)
+    min_len = (
+        _API_SERVER_POSTURE_KEY_MIN_LEN_NETWORK
+        if network_accessible
+        else _API_SERVER_POSTURE_KEY_MIN_LEN_LOOPBACK
+    )
+
+    try:
+        from hermes_cli.auth import has_usable_secret
+    except ImportError:
+        has_usable_secret = None  # type: ignore[assignment]
+
+    if has_usable_secret is not None:
+        usable = has_usable_secret(key, min_length=min_len)
+    else:
+        usable = bool(key) and len(key.strip()) >= min_len
+
+    if not usable:
+        if not key:
+            return False, (
+                "API_SERVER_KEY is required to enable the API server. "
+                "Bearer auth is the trust boundary on every bind, including "
+                "loopback."
+            )
+        return False, (
+            f"API_SERVER_KEY is too short or a placeholder for bind {host!r} "
+            f"(min {min_len} chars; non-loopback binds require a strong "
+            "secret — generate one with `openssl rand -hex 32`)."
+        )
+
+    if network_accessible and not (tls or tailscale_only):
+        return False, (
+            f"API server bound to non-loopback host {host!r} must declare a "
+            "safe transport posture: set platforms.api_server.extra.tls: true "
+            "(TLS terminated upstream) or platforms.api_server.extra."
+            "tailscale_only: true (bind is on a Tailscale interface)."
+        )
+
+    return True, None
 
 
 class ResponseStore:
@@ -1246,6 +1358,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_move": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -1276,6 +1389,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+                "session_move_last": {"method": "POST", "path": "/api/sessions/{session_id}/move/last"},
+                "session_move_range": {"method": "POST", "path": "/api/sessions/{session_id}/move/range"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
@@ -1618,6 +1733,280 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+
+    # ------------------------------------------------------------------
+    # Session move endpoints (HRM-T0a step 6)
+    # ------------------------------------------------------------------
+    #
+    # Thin wrappers over ``SessionDB.move_turns`` — the API layer never
+    # reimplements the transaction. The primitive owns: BEGIN IMMEDIATE,
+    # idempotency replay, dry-run rollback, soft-delete of src rows, and
+    # move_log append. The handlers translate HTTP shape ↔ primitive
+    # contract and map raised exceptions to OpenAI-style error responses.
+
+    def _extract_move_idempotency_key(
+        self, request: "web.Request", body: Dict[str, Any]
+    ) -> Optional[str]:
+        """Resolve the idempotency key from body or ``Idempotency-Key`` header.
+
+        Body field takes precedence so a client that retries with a fresh
+        header value but the original body still hits the same move_log row.
+        Returns ``None`` if absent — the primitive enforces ``required for
+        commit`` semantics itself, and we let it raise so 400 messaging
+        matches the dry-run-allowed contract.
+        """
+        raw_body = body.get("idempotency_key")
+        if isinstance(raw_body, str) and raw_body.strip():
+            return raw_body.strip()
+        raw_header = request.headers.get("Idempotency-Key", "").strip()
+        return raw_header or None
+
+    @staticmethod
+    def _validate_move_idempotency_key(value: Optional[str]) -> Optional[str]:
+        """Return an error message for an invalid idempotency key, or None."""
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            return "idempotency_key must be a non-empty string"
+        if len(value) > 256:
+            return "idempotency_key must be <= 256 characters"
+        if re.search(r'[\r\n\x00]', value):
+            return "idempotency_key must not contain control characters"
+        return None
+
+    def _resolve_move_dst_session_id(
+        self, body: Dict[str, Any]
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract and validate the destination session id from the body."""
+        raw = body.get("dst_session_id") or body.get("destination_session_id")
+        if not raw or not isinstance(raw, str) or not raw.strip():
+            return None, web.json_response(
+                _openai_error(
+                    "Missing 'dst_session_id'",
+                    code="missing_dst_session_id",
+                    param="dst_session_id",
+                ),
+                status=400,
+            )
+        dst = raw.strip()
+        if len(dst) > self._MAX_SESSION_HEADER_LEN or re.search(r'[\r\n\x00]', dst):
+            return None, web.json_response(
+                _openai_error(
+                    "Invalid 'dst_session_id'",
+                    code="invalid_dst_session_id",
+                    param="dst_session_id",
+                ),
+                status=400,
+            )
+        return dst, None
+
+    async def _handle_session_move_last(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/move/last — move the last N turns.
+
+        Body: ``{ "dst_session_id": str, "count": int >= 1,
+                  "idempotency_key": str?, "dry_run": bool? }``.
+
+        Header ``Idempotency-Key`` is accepted as a fallback so generic
+        OpenAI-style retry middleware composes with this endpoint without
+        the client rewriting the body. The body field wins on conflict.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        src_session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        raw_count = body.get("count")
+        if raw_count is None or isinstance(raw_count, bool):
+            # bool is a subclass of int — refuse {"count": true} explicitly.
+            return web.json_response(
+                _openai_error(
+                    "Missing 'count'",
+                    code="missing_count",
+                    param="count",
+                ),
+                status=400,
+            )
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            return web.json_response(
+                _openai_error("'count' must be an integer", code="invalid_count", param="count"),
+                status=400,
+            )
+        if count < 1:
+            return web.json_response(
+                _openai_error("'count' must be >= 1", code="invalid_count", param="count"),
+                status=400,
+            )
+
+        return await self._dispatch_session_move(
+            request,
+            src_session_id=src_session_id,
+            range_spec=f"last:{count}",
+            body=body,
+        )
+
+    async def _handle_session_move_range(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/move/range — move messages id A..B.
+
+        Body: ``{ "dst_session_id": str, "from_id": int, "to_id": int,
+                  "idempotency_key": str?, "dry_run": bool? }``.
+
+        The id space matches ``messages.id`` (active rows only). Out-of-order
+        or non-integer bounds produce 400 with ``invalid_range``; the
+        underlying primitive owns the inclusive-bounds semantics.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        src_session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        raw_from = body.get("from_id")
+        raw_to = body.get("to_id")
+        if raw_from is None or raw_to is None or isinstance(raw_from, bool) or isinstance(raw_to, bool):
+            return web.json_response(
+                _openai_error(
+                    "'from_id' and 'to_id' are required integers",
+                    code="missing_range",
+                    param="from_id",
+                ),
+                status=400,
+            )
+        try:
+            from_id = int(raw_from)
+            to_id = int(raw_to)
+        except (TypeError, ValueError):
+            return web.json_response(
+                _openai_error(
+                    "'from_id' and 'to_id' must be integers",
+                    code="invalid_range",
+                    param="from_id",
+                ),
+                status=400,
+            )
+        if from_id < 1 or to_id < 1:
+            return web.json_response(
+                _openai_error(
+                    "'from_id' and 'to_id' must be positive",
+                    code="invalid_range",
+                    param="from_id",
+                ),
+                status=400,
+            )
+        if from_id > to_id:
+            return web.json_response(
+                _openai_error(
+                    "'from_id' must be <= 'to_id'",
+                    code="invalid_range",
+                    param="from_id",
+                ),
+                status=400,
+            )
+
+        return await self._dispatch_session_move(
+            request,
+            src_session_id=src_session_id,
+            range_spec=f"range:{from_id}..{to_id}",
+            body=body,
+        )
+
+    async def _dispatch_session_move(
+        self,
+        request: "web.Request",
+        *,
+        src_session_id: str,
+        range_spec: str,
+        body: Dict[str, Any],
+    ) -> "web.Response":
+        """Shared validation + primitive call once the range_spec is built.
+
+        Splits out from ``_execute_session_move`` so the move-last and
+        move-range handlers can consume the body once and share the rest.
+        """
+        _, src_err = self._get_existing_session_or_404(src_session_id)
+        if src_err:
+            return src_err
+
+        dst_session_id, dst_err = self._resolve_move_dst_session_id(body)
+        if dst_err:
+            return dst_err
+        assert dst_session_id is not None
+        if dst_session_id == src_session_id:
+            return web.json_response(
+                _openai_error(
+                    "dst_session_id must differ from src session_id",
+                    code="same_src_and_dst",
+                    param="dst_session_id",
+                ),
+                status=400,
+            )
+
+        dry_run = _coerce_request_bool(body.get("dry_run"), default=False)
+        idempotency_key = self._extract_move_idempotency_key(request, body)
+        key_err = self._validate_move_idempotency_key(idempotency_key)
+        if key_err:
+            return web.json_response(
+                _openai_error(key_err, code="invalid_idempotency_key", param="idempotency_key"),
+                status=400,
+            )
+        if not dry_run and not idempotency_key:
+            return web.json_response(
+                _openai_error(
+                    "idempotency_key is required for commit (set dry_run=true to plan)",
+                    code="missing_idempotency_key",
+                    param="idempotency_key",
+                ),
+                status=400,
+            )
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+
+        try:
+            result = db.move_turns(
+                src_session_id=src_session_id,
+                dst_session_id=dst_session_id,
+                range_spec=range_spec,
+                idempotency_key=idempotency_key,
+                dry_run=dry_run,
+            )
+        except KeyError as exc:
+            msg = str(exc).strip("'\"")
+            code = "dst_session_not_found" if "dst" in msg else "src_session_not_found"
+            return web.json_response(
+                _openai_error(msg, code=code, err_type="invalid_request_error"),
+                status=404,
+            )
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_move_request"),
+                status=400,
+            )
+        except Exception:
+            logger.exception(
+                "session move failed: src=%s dst=%s range=%s",
+                src_session_id, dst_session_id, range_spec,
+            )
+            return web.json_response(
+                _openai_error("Move failed", err_type="server_error", code="move_failed"),
+                status=500,
+            )
+
+        payload = dict(result)
+        payload["object"] = "hermes.session.move"
+        return web.json_response(payload, status=200)
 
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
@@ -4397,6 +4786,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
+            self._app.router.add_post("/api/sessions/{session_id}/move/last", self._handle_session_move_last)
+            self._app.router.add_post("/api/sessions/{session_id}/move/range", self._handle_session_move_range)
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
@@ -4438,38 +4829,25 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
-            # Refuse to start without authentication. The API server can
-            # dispatch terminal-capable agent work, so every deployment needs
-            # an explicit API_SERVER_KEY regardless of bind address.
-            if not self._api_key:
+            # HRM-T0a step 10 posture validator: refuse to start unless the
+            # configured auth + bind posture is safe (default-deny). Covers
+            # the legacy openclaw#64586 + 0day-hardening checks (key required,
+            # >=16 chars on non-loopback) and adds the TLS-or-Tailscale-only
+            # requirement for non-loopback binds.
+            posture_extra = {
+                "host": self._host,
+                "key": self._api_key,
+                "tls": bool((self.config.extra or {}).get("tls", False)),
+                "tailscale_only": bool(
+                    (self.config.extra or {}).get("tailscale_only", False)
+                ),
+            }
+            ok, reason = validate_api_server_posture(posture_extra, enabled=True)
+            if not ok:
                 logger.error(
-                    "[%s] Refusing to start: API_SERVER_KEY is required for the API server, "
-                    "including loopback-only binds on %s.",
-                    self.name, self._host,
+                    "[%s] Refusing to start API server: %s", self.name, reason,
                 )
                 return False
-
-            # Refuse to start network-accessible with a placeholder or weak key.
-            # Ported from openclaw/openclaw#64586; entropy floor raised to 16 in
-            # the June 2026 hermes-0day hardening (an 8-char key dispatching
-            # terminal-capable agent work on a public bind is brute-forceable).
-            if is_network_accessible(self._host) and self._api_key:
-                try:
-                    from hermes_cli.auth import has_usable_secret
-                    if not has_usable_secret(self._api_key, min_length=16):
-                        logger.error(
-                            "[%s] Refusing to start: API_SERVER_KEY is a "
-                            "placeholder or too short (<16 chars) for a "
-                            "network-accessible bind. This endpoint dispatches "
-                            "terminal-capable agent work — a guessable key is "
-                            "remote code execution. Generate a strong secret "
-                            "(e.g. `openssl rand -hex 32`) and set "
-                            "API_SERVER_KEY before exposing it on %s.",
-                            self.name, self._host,
-                        )
-                        return False
-                except ImportError:
-                    pass
 
             # Loud warning when a network-accessible API server runs against an
             # unsandboxed local terminal backend. The API server can drive the

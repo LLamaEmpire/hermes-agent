@@ -2787,9 +2787,778 @@ class GatewaySlashCommandsMixin:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
 
-    async def _handle_topic_command(self, event: MessageEvent, args: str = "") -> str:
-        """Handle /topic for Telegram DM user-managed topic sessions."""
+    # ── HRM-T0a step 5: /topic active-topic-pointer subcommands ────────
+
+    _TOPIC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,63}$")
+
+    def _topic_principal_for_source(self, source):
+        """Build a ``PlatformPrincipal`` from a SessionSource.
+
+        Returns ``None`` if the principal can't be assembled (missing
+        user_id/chat_id) so the caller emits a user-visible error rather
+        than touching the pointer table.
+        """
+        from gateway.active_topic import PlatformPrincipal
+        app_id = getattr(self.config, "topic_default_app_id", None)
+        try:
+            return PlatformPrincipal.from_source(source, app_id=str(app_id))
+        except ValueError:
+            return None
+
+    # ── HRM-T0a step 8: legacy mode + missing-app_id guards ────────────
+
+    # Set of subcommands that mutate the active-topic-pointer or move
+    # transcript rows. Refused in legacy mode; require topic_default_app_id.
+    _TOPIC_MUTATOR_SUBCOMMANDS = frozenset(
+        {
+            "new",
+            "switch",
+            "clear",
+            "bind-thread",
+            "unbind-thread",
+            "move-last",
+            "move-range",
+        }
+    )
+
+    def _topic_missing_app_id_message(self) -> str:
+        """User-visible setup-required message when topic_default_app_id is unset.
+
+        Returned by mutator subcommands so the slash UX fails closed with
+        a clear instruction rather than a confusing "no principal" error.
+        Routing is already config-driven: the inbound pre-pass short-
+        circuits with ``app_id=None`` (config.py§topic_default_app_id).
+        """
+        return (
+            "/topic: setup required — gateway has no `topic.default_app_id` "
+            "configured, so the active-topic pointer cannot be written. "
+            "Set `topic.default_app_id` in config.yaml (or via "
+            "`hermes config set topic.default_app_id <repo-slug>`) and "
+            "restart the gateway, then retry."
+        )
+
+    def _topic_legacy_refusal(self, source, reason: str) -> str:
+        """Return the legacy read-only banner; log once per process.
+
+        Mutators routed through here when ``is_legacy_principal_route``
+        flags the inbound source. The pointer table is never touched.
+        """
+        from gateway.active_topic import (
+            LEGACY_READONLY_MESSAGE,
+            _maybe_log_legacy_banner_once,
+        )
+        _maybe_log_legacy_banner_once(reason)
+        return LEGACY_READONLY_MESSAGE
+
+    def _topic_legacy_state_for_source(self, source):
+        """Return ``(is_legacy, reason)`` for the inbound source.
+
+        Defensive wrapper around :func:`gateway.active_topic.is_legacy_principal_route`
+        so the slash handler doesn't raise on transient SessionDB errors —
+        we default to non-legacy (allow) so a DB hiccup doesn't lock the
+        user out of pointer commands; the migration marker + Telegram-
+        topic-mode read are both nullable and read-only.
+        """
+        from gateway.active_topic import is_legacy_principal_route
+        try:
+            return is_legacy_principal_route(
+                self._session_db,
+                source,
+                app_id=getattr(self.config, "topic_default_app_id", None),
+            )
+        except Exception:
+            logger.debug("legacy-detect: is_legacy_principal_route failed", exc_info=True)
+            return False, ""
+
+    async def _emit_topic_pointer_banner(self, source, banner_text: str) -> None:
+        """Emit the topic-switch banner via the platform adapter.
+
+        Raises on transport failure so the caller can roll the pointer
+        write back — charter § Owner confirmation contract: if the
+        gateway cannot emit the banner, the switch MUST be rolled back,
+        not silently held.
+        """
+        adapter = (
+            self.adapters.get(source.platform)
+            if getattr(self, "adapters", None)
+            else None
+        )
+        if adapter is None:
+            raise RuntimeError(
+                f"no adapter for platform={source.platform!r}; cannot emit topic banner"
+            )
+        from gateway.platforms.base import _thread_metadata_for_source
+        meta = _thread_metadata_for_source(source)
+        await adapter.send(str(source.chat_id), banner_text, metadata=meta)
+
+    async def _rollback_topic_pointer(
+        self,
+        principal,
+        *,
+        prior_row,
+        updated_by: str,
+    ) -> None:
+        """Compensating-rollback: restore pointer to ``prior_row`` or clear.
+
+        Uses ``require_registered=False`` because the prior row already
+        passed registry at original write time; re-checking on rollback
+        would refuse legitimate restoration if the topic was concurrently
+        de-registered, which is the wrong failure mode for a rollback.
+        """
+        from gateway.active_topic import set_active_topic, clear_active_topic
+        if prior_row is None:
+            try:
+                await clear_active_topic(
+                    self._session_db, principal, updated_by=updated_by
+                )
+            except Exception:
+                logger.exception("topic pointer rollback (clear) failed")
+            return
+        try:
+            await set_active_topic(
+                self._session_db,
+                principal,
+                topic_id=str(prior_row.get("topic_id")),
+                bound_thread_id=prior_row.get("bound_thread_id"),
+                updated_by=updated_by,
+                require_registered=False,
+            )
+        except Exception:
+            logger.exception("topic pointer rollback (restore) failed")
+
+    def _topic_help_text(self) -> str:
+        return (
+            "/topic — same-chat active-topic-pointer routing\n"
+            "  /topic                show current active topic\n"
+            "  /topic list           list active pointer + bound thread\n"
+            "  /topic switch <slug>  set active topic (registers + banner)\n"
+            "  /topic new <slug>     alias for switch (must already be registered)\n"
+            "  /topic clear          clear active topic\n"
+            "  /topic bind-thread    bind current thread to active topic\n"
+            "  /topic unbind-thread  clear thread binding on active topic\n"
+            "  /topic move-last <N> --to <slug> [--dry-run] [--idempotency-key <k>]\n"
+            "                        move the last N turns from active topic into <slug>\n"
+            "  /topic move-range <A..B> --to <slug> [--dry-run] [--idempotency-key <k>]\n"
+            "                        move messages id A..B from active topic into <slug>\n"
+            "  /topic help           this text"
+        )
+
+    async def _handle_topic_pointer_command(self, event: MessageEvent) -> str:
+        """HRM-T0a same-chat active-topic-pointer subcommand dispatcher."""
         source = event.source
+        if not self._session_db:
+            from hermes_state import format_session_db_unavailable
+            return format_session_db_unavailable(
+                prefix=t("gateway.shared.session_db_unavailable_prefix")
+            )
+
+        # Authorization defence-in-depth (mirrors legacy handler).
+        auth_fn = getattr(self, "_is_user_authorized", None)
+        if callable(auth_fn):
+            try:
+                if not auth_fn(source):
+                    return t("gateway.topic.unauthorized")
+            except Exception:
+                logger.debug("topic-pointer auth check failed", exc_info=True)
+
+        # Step 8: app_id fail-closed for mutator surface. Read-only
+        # subcommands (show/list/help) still work — they require a
+        # principal but not necessarily a configured default app_id,
+        # because there's nothing to write. We compute the app_id-
+        # dependent principal lazily so the early read-only paths can
+        # answer without forcing the user to set up app_id first.
+        raw_args = (event.get_command_args() or "").strip()
+        try:
+            parts = shlex.split(raw_args) if raw_args else []
+        except ValueError as exc:
+            return f"/topic: failed to parse args: {exc}"
+        sub = (parts[0].lower() if parts else "")
+        rest = parts[1:]
+
+        configured_app_id = getattr(self.config, "topic_default_app_id", None)
+        is_mutator = sub in self._TOPIC_MUTATOR_SUBCOMMANDS
+
+        if is_mutator and not configured_app_id:
+            return self._topic_missing_app_id_message()
+
+        # Step 8: refuse mutators in legacy mode; read-only still works.
+        if is_mutator:
+            is_legacy, reason = self._topic_legacy_state_for_source(source)
+            if is_legacy:
+                return self._topic_legacy_refusal(source, reason)
+
+        principal = self._topic_principal_for_source(source)
+        if principal is None:
+            return (
+                "/topic requires both user_id and chat_id on the inbound "
+                "principal — refused."
+            )
+
+        if not raw_args:
+            return await self._handle_topic_subcommand_show(principal)
+        if not parts:
+            return await self._handle_topic_subcommand_show(principal)
+
+        if sub in {"help", "?", "-h", "--help"}:
+            return self._topic_help_text()
+        if sub == "list":
+            return await self._handle_topic_subcommand_show(principal)
+        if sub in {"switch", "new"}:
+            if not rest:
+                return f"/topic {sub} <slug> — slug required"
+            return await self._handle_topic_subcommand_switch(
+                source, principal, rest[0]
+            )
+        if sub == "clear":
+            return await self._handle_topic_subcommand_clear(source, principal)
+        if sub == "bind-thread":
+            return await self._handle_topic_subcommand_bind_thread(source, principal)
+        if sub == "unbind-thread":
+            return await self._handle_topic_subcommand_unbind_thread(source, principal)
+        if sub == "move-last":
+            return await self._handle_topic_subcommand_move_last(
+                source, principal, rest
+            )
+        if sub == "move-range":
+            return await self._handle_topic_subcommand_move_range(
+                source, principal, rest
+            )
+        return (
+            f"/topic: unknown subcommand {sub!r}. "
+            f"Try `/topic help`."
+        )
+
+    async def _handle_topic_subcommand_show(self, principal) -> str:
+        from gateway.active_topic import read_active_topic
+        row = await read_active_topic(self._session_db, principal)
+        if not row:
+            return "[topic] no active topic — `/topic switch <slug>` to set one"
+        bound = row.get("bound_thread_id")
+        if bound:
+            return f"[topic] active: {row['topic_id']} (bound thread: {bound})"
+        return f"[topic] active: {row['topic_id']}"
+
+    async def _handle_topic_subcommand_switch(
+        self, source, principal, raw_slug: str
+    ) -> str:
+        from gateway.active_topic import (
+            TopicNotRegisteredError,
+            read_active_topic,
+            set_active_topic,
+        )
+        slug = raw_slug.strip().lower()
+        if not self._TOPIC_ID_RE.match(slug):
+            return (
+                f"/topic switch: {raw_slug!r} is not a valid topic slug "
+                f"(use lowercase alphanumerics, _ or -, ≤64 chars)"
+            )
+
+        prior = await read_active_topic(self._session_db, principal)
+        if prior and prior.get("topic_id") == slug:
+            return f"[topic → {slug}] already active"
+
+        updated_by = f"slash:/topic switch:{source.user_id}"
+        try:
+            resp = await set_active_topic(
+                self._session_db,
+                principal,
+                topic_id=slug,
+                bound_thread_id=None,
+                updated_by=updated_by,
+            )
+        except TopicNotRegisteredError as exc:
+            return (
+                f"/topic switch: refused — topic {slug!r} is not registered "
+                f"under app {principal.app_id!r} ({exc})"
+            )
+        prior_row = resp.get("prior") if isinstance(resp, dict) else None
+
+        banner = f"[topic → {slug}]"
+        try:
+            await self._emit_topic_pointer_banner(source, banner)
+        except Exception as exc:
+            logger.warning(
+                "topic banner emit failed; rolling back pointer: %s", exc
+            )
+            await self._rollback_topic_pointer(
+                principal,
+                prior_row=prior_row,
+                updated_by=f"slash:/topic rollback:{source.user_id}",
+            )
+            return (
+                f"/topic switch: failed to confirm switch (banner emit "
+                f"error: {exc}); pointer rolled back."
+            )
+        return ""
+
+    async def _handle_topic_subcommand_clear(self, source, principal) -> str:
+        from gateway.active_topic import clear_active_topic, set_active_topic
+        updated_by = f"slash:/topic clear:{source.user_id}"
+        prior = await clear_active_topic(
+            self._session_db, principal, updated_by=updated_by
+        )
+        if prior is None:
+            return "[topic] no active topic to clear"
+
+        banner = "[topic cleared]"
+        try:
+            await self._emit_topic_pointer_banner(source, banner)
+        except Exception as exc:
+            logger.warning(
+                "topic banner emit failed on clear; rolling back: %s", exc
+            )
+            try:
+                await set_active_topic(
+                    self._session_db,
+                    principal,
+                    topic_id=str(prior.get("topic_id")),
+                    bound_thread_id=prior.get("bound_thread_id"),
+                    updated_by=f"slash:/topic rollback:{source.user_id}",
+                    require_registered=False,
+                )
+            except Exception:
+                logger.exception("topic clear rollback failed")
+            return (
+                f"/topic clear: failed to confirm clear (banner emit "
+                f"error: {exc}); pointer rolled back."
+            )
+        return ""
+
+    async def _handle_topic_subcommand_bind_thread(self, source, principal) -> str:
+        from gateway.active_topic import read_active_topic, set_active_topic
+        thread_id = getattr(source, "thread_id", None)
+        if not thread_id:
+            return "/topic bind-thread: no thread_id on inbound message"
+        prior = await read_active_topic(self._session_db, principal)
+        if not prior:
+            return "/topic bind-thread: no active topic to bind"
+        topic_id = str(prior.get("topic_id"))
+        updated_by = f"slash:/topic bind-thread:{source.user_id}"
+        try:
+            await set_active_topic(
+                self._session_db,
+                principal,
+                topic_id=topic_id,
+                bound_thread_id=str(thread_id),
+                updated_by=updated_by,
+                require_registered=False,
+            )
+        except Exception as exc:
+            return f"/topic bind-thread: failed: {exc}"
+        banner = f"[topic {topic_id} ⇄ thread {thread_id}]"
+        try:
+            await self._emit_topic_pointer_banner(source, banner)
+        except Exception as exc:
+            logger.warning(
+                "topic banner emit failed on bind-thread; rolling back: %s", exc
+            )
+            await self._rollback_topic_pointer(
+                principal,
+                prior_row=prior,
+                updated_by=f"slash:/topic rollback:{source.user_id}",
+            )
+            return (
+                f"/topic bind-thread: failed to confirm bind (banner emit "
+                f"error: {exc}); pointer rolled back."
+            )
+        return ""
+
+    async def _handle_topic_subcommand_unbind_thread(self, source, principal) -> str:
+        from gateway.active_topic import read_active_topic, set_active_topic
+        prior = await read_active_topic(self._session_db, principal)
+        if not prior:
+            return "/topic unbind-thread: no active topic"
+        if not prior.get("bound_thread_id"):
+            return "/topic unbind-thread: no thread binding to clear"
+        topic_id = str(prior.get("topic_id"))
+        updated_by = f"slash:/topic unbind-thread:{source.user_id}"
+        try:
+            await set_active_topic(
+                self._session_db,
+                principal,
+                topic_id=topic_id,
+                bound_thread_id=None,
+                updated_by=updated_by,
+                require_registered=False,
+            )
+        except Exception as exc:
+            return f"/topic unbind-thread: failed: {exc}"
+        banner = f"[topic {topic_id} — thread unbound]"
+        try:
+            await self._emit_topic_pointer_banner(source, banner)
+        except Exception as exc:
+            logger.warning(
+                "topic banner emit failed on unbind-thread; rolling back: %s", exc
+            )
+            await self._rollback_topic_pointer(
+                principal,
+                prior_row=prior,
+                updated_by=f"slash:/topic rollback:{source.user_id}",
+            )
+            return (
+                f"/topic unbind-thread: failed to confirm (banner emit "
+                f"error: {exc}); pointer rolled back."
+            )
+        return ""
+
+    # ── HRM-T0a step 7: /topic move-last + move-range ──────────────────
+
+    @staticmethod
+    def _parse_topic_move_kv_flags(
+        tokens: list,
+    ) -> tuple[Optional[str], Optional[str], bool, Optional[str]]:
+        """Pull flags shared by move-last and move-range from a token list.
+
+        Recognises ``--to <slug>``, ``to:<slug>``, ``--dry-run`` /
+        ``--dry`` (boolean), ``--idempotency-key <k>`` / ``--key <k>`` /
+        ``key:<k>``. Returns ``(dst_slug, idempotency_key, dry_run, error)``;
+        ``error`` is None on success, else a user-visible string explaining
+        the parse failure. Positional tokens that are NOT flags are
+        ignored here — callers consume the leading positional (count or
+        range) themselves before passing the remainder in.
+        """
+        dst_slug: Optional[str] = None
+        idempotency_key: Optional[str] = None
+        dry_run = False
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            tl = tok.lower()
+            if tl in {"--to", "-t"}:
+                if i + 1 >= len(tokens):
+                    return None, None, False, f"{tok}: missing value"
+                dst_slug = tokens[i + 1]
+                i += 2
+                continue
+            if tl.startswith("to:"):
+                dst_slug = tok[3:]
+                i += 1
+                continue
+            if tl.startswith("--to="):
+                dst_slug = tok[len("--to="):]
+                i += 1
+                continue
+            if tl in {"--dry-run", "--dry"}:
+                dry_run = True
+                i += 1
+                continue
+            if tl in {"--idempotency-key", "--key", "-k"}:
+                if i + 1 >= len(tokens):
+                    return None, None, False, f"{tok}: missing value"
+                idempotency_key = tokens[i + 1]
+                i += 2
+                continue
+            if tl.startswith("--idempotency-key="):
+                idempotency_key = tok[len("--idempotency-key="):]
+                i += 1
+                continue
+            if tl.startswith("key:"):
+                idempotency_key = tok[4:]
+                i += 1
+                continue
+            # Unknown token — surface so the user knows the slash didn't
+            # silently drop a flag they meant.
+            return None, None, False, f"unrecognised arg {tok!r}"
+        return dst_slug, idempotency_key, dry_run, None
+
+    def _resolve_topic_move_session_ids(
+        self, source, principal, src_topic_id: str, dst_topic_id: str
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Resolve (src_session_id, dst_session_id, error).
+
+        Looks both sessions up in the gateway's :class:`SessionStore`
+        keyed by the deterministic ``build_topic_session_key`` (the same
+        key the inbound routing pre-pass uses). The src session must
+        already exist — if it doesn't, the user has nothing to move.
+        The dst session is created on demand because the caller has
+        already verified ``assert_registered(app_id, dst_topic_id)``
+        before reaching here, so materialising an empty session is
+        the natural cost of a valid recovery command.
+        """
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return None, None, (
+                "/topic move: session store unavailable — refusing move"
+            )
+        from gateway.active_topic import build_topic_session_key
+        profile = getattr(self.config, "agent_profile", None)
+        try:
+            src_key = build_topic_session_key(
+                principal, topic_id=src_topic_id, profile=profile
+            )
+            dst_key = build_topic_session_key(
+                principal, topic_id=dst_topic_id, profile=profile
+            )
+        except ValueError as exc:
+            return None, None, f"/topic move: invalid topic key: {exc}"
+
+        entries = getattr(store, "_entries", {}) or {}
+        src_entry = entries.get(src_key)
+        if src_entry is None or not getattr(src_entry, "session_id", None):
+            return None, None, (
+                f"/topic move: no session for active topic "
+                f"{src_topic_id!r} yet — send a message first"
+            )
+
+        dst_entry = entries.get(dst_key)
+        if dst_entry is None or not getattr(dst_entry, "session_id", None):
+            # Create-on-demand: dst slug already passed registry; an
+            # empty session is the legitimate landing pad for moved turns.
+            try:
+                dst_entry = store.get_or_create_session(
+                    source, _session_key=dst_key
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                return None, None, (
+                    f"/topic move: failed to materialise dst session "
+                    f"{dst_topic_id!r}: {exc}"
+                )
+            if dst_entry is None or not getattr(dst_entry, "session_id", None):
+                return None, None, (
+                    f"/topic move: dst session not materialised for "
+                    f"topic {dst_topic_id!r}"
+                )
+        return src_entry.session_id, dst_entry.session_id, None
+
+    async def _execute_topic_move(
+        self,
+        source,
+        principal,
+        *,
+        range_spec: str,
+        dst_slug_raw: str,
+        idempotency_key: Optional[str],
+        dry_run: bool,
+    ) -> str:
+        """Shared move executor used by move-last and move-range.
+
+        Slash UX is a thin call into ``SessionDB.move_turns`` — the same
+        primitive the API server's ``POST /api/sessions/{id}/move/{...}``
+        endpoints use. Validation order mirrors the API handlers so the
+        user-visible error names line up across surfaces.
+        """
+        from gateway.active_topic import (
+            TopicNotRegisteredError,
+            assert_registered,
+            read_active_topic,
+        )
+
+        # 1) Validate dst slug shape (same regex as switch).
+        dst_slug = (dst_slug_raw or "").strip().lower()
+        if not dst_slug:
+            return "/topic move: --to <slug> is required"
+        if not self._TOPIC_ID_RE.match(dst_slug):
+            return (
+                f"/topic move: {dst_slug_raw!r} is not a valid topic slug "
+                f"(use lowercase alphanumerics, _ or -, ≤64 chars)"
+            )
+
+        # 2) Idempotency-key contract: required on commit, validated shape.
+        if idempotency_key is not None:
+            if not idempotency_key or len(idempotency_key) > 256:
+                return (
+                    "/topic move: --idempotency-key must be a non-empty "
+                    "string ≤256 chars"
+                )
+            if re.search(r"[\r\n\x00]", idempotency_key):
+                return (
+                    "/topic move: --idempotency-key must not contain "
+                    "control characters"
+                )
+        if not dry_run and not idempotency_key:
+            return (
+                "/topic move: --idempotency-key required for commit "
+                "(or pass --dry-run to plan)"
+            )
+
+        # 3) Read active topic → that's our source.
+        prior = await read_active_topic(self._session_db, principal)
+        if not prior or not prior.get("topic_id"):
+            return (
+                "/topic move: no active topic — `/topic switch <slug>` "
+                "first, then re-run the move."
+            )
+        src_topic_id = str(prior["topic_id"])
+        if src_topic_id == dst_slug:
+            return (
+                f"/topic move: destination must differ from current "
+                f"topic ({src_topic_id!r})"
+            )
+
+        # 4) Verify dst topic is registered under this principal's app.
+        try:
+            await assert_registered(principal.app_id, dst_slug)
+        except TopicNotRegisteredError as exc:
+            return (
+                f"/topic move: refused — topic {dst_slug!r} is not "
+                f"registered under app {principal.app_id!r} ({exc})"
+            )
+
+        # 5) Resolve src / dst session_ids.
+        src_session_id, dst_session_id, err = self._resolve_topic_move_session_ids(
+            source, principal, src_topic_id, dst_slug
+        )
+        if err is not None:
+            return err
+
+        # 6) Call the primitive directly — same contract as API endpoints.
+        try:
+            result = await asyncio.to_thread(
+                self._session_db.move_turns,
+                src_session_id=src_session_id,
+                dst_session_id=dst_session_id,
+                range_spec=range_spec,
+                idempotency_key=idempotency_key,
+                dry_run=dry_run,
+            )
+        except KeyError as exc:
+            msg = str(exc).strip("'\"")
+            return f"/topic move: session not found ({msg})"
+        except ValueError as exc:
+            return f"/topic move: invalid request ({exc})"
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.exception(
+                "/topic move primitive failed: src=%s dst=%s range=%s",
+                src_session_id, dst_session_id, range_spec,
+            )
+            return f"/topic move: failed: {exc}"
+
+        moved_count = len(result.get("src_message_ids") or [])
+        if dry_run:
+            return (
+                f"[topic move dry-run] {range_spec}: {moved_count} turn(s) "
+                f"would move from {src_topic_id!r} → {dst_slug!r}"
+            )
+
+        replay = bool(result.get("replay"))
+        banner = (
+            f"[topic move → {dst_slug}] {moved_count} turn(s) moved"
+            + (" (replay)" if replay else "")
+        )
+        try:
+            await self._emit_topic_pointer_banner(source, banner)
+        except Exception as exc:
+            # Move commits are NOT rolled back on banner failure — the
+            # primitive's idempotency_key is the recovery story (replay
+            # returns byte-equal). Surface the banner-emit failure visibly
+            # so the user knows the move landed but the confirmation
+            # didn't reach the surface.
+            logger.warning(
+                "/topic move banner emit failed (move already committed): %s",
+                exc,
+            )
+            return (
+                f"/topic move: committed {moved_count} turn(s) from "
+                f"{src_topic_id!r} → {dst_slug!r}, but banner emit "
+                f"error: {exc}. Replay with the same idempotency_key is "
+                f"safe."
+            )
+        return ""
+
+    async def _handle_topic_subcommand_move_last(
+        self, source, principal, args: list
+    ) -> str:
+        if not args:
+            return "/topic move-last <N> --to <slug> — missing N"
+        raw_n = args[0]
+        # Refuse if the positional slot is actually a flag — the user
+        # forgot the count.
+        if raw_n.startswith("-") and not raw_n.lstrip("-").isdigit():
+            return "/topic move-last <N> --to <slug> — missing N"
+        if ":" in raw_n and not raw_n.lstrip("-").isdigit():
+            return "/topic move-last <N> --to <slug> — missing N"
+        try:
+            count = int(raw_n)
+        except (TypeError, ValueError):
+            return f"/topic move-last: invalid count {raw_n!r} (expected int)"
+        if count < 1:
+            return f"/topic move-last: count must be >= 1 (got {count})"
+        dst_slug, idem_key, dry_run, parse_err = self._parse_topic_move_kv_flags(
+            args[1:]
+        )
+        if parse_err is not None:
+            return f"/topic move-last: {parse_err}"
+        if not dst_slug:
+            return "/topic move-last: --to <slug> is required"
+        return await self._execute_topic_move(
+            source, principal,
+            range_spec=f"last:{count}",
+            dst_slug_raw=dst_slug,
+            idempotency_key=idem_key,
+            dry_run=dry_run,
+        )
+
+    async def _handle_topic_subcommand_move_range(
+        self, source, principal, args: list
+    ) -> str:
+        if not args:
+            return "/topic move-range <A..B> --to <slug> — missing range"
+        raw_range = args[0]
+        # Refuse if the positional slot is actually a flag.
+        if raw_range.startswith("-"):
+            return "/topic move-range <A..B> --to <slug> — missing range"
+        if ".." not in raw_range:
+            return (
+                f"/topic move-range: invalid range {raw_range!r} "
+                f"(expected A..B)"
+            )
+        a_str, _, b_str = raw_range.partition("..")
+        try:
+            from_id = int(a_str)
+            to_id = int(b_str)
+        except (TypeError, ValueError):
+            return (
+                f"/topic move-range: invalid range {raw_range!r} "
+                f"(A and B must be integers)"
+            )
+        if from_id < 1 or to_id < 1:
+            return (
+                f"/topic move-range: range bounds must be positive "
+                f"(got {from_id}..{to_id})"
+            )
+        if from_id > to_id:
+            return (
+                f"/topic move-range: from_id must be <= to_id "
+                f"(got {from_id}..{to_id})"
+            )
+        dst_slug, idem_key, dry_run, parse_err = self._parse_topic_move_kv_flags(
+            args[1:]
+        )
+        if parse_err is not None:
+            return f"/topic move-range: {parse_err}"
+        if not dst_slug:
+            return "/topic move-range: --to <slug> is required"
+        return await self._execute_topic_move(
+            source, principal,
+            range_spec=f"range:{from_id}..{to_id}",
+            dst_slug_raw=dst_slug,
+            idempotency_key=idem_key,
+            dry_run=dry_run,
+        )
+
+    async def _handle_topic_command(self, event: MessageEvent, args: str = "") -> str:
+        """Handle /topic.
+
+        HRM-T0a step 5: when ``topic_slash_ux_enabled`` (default-deny) is
+        on AND the gateway has a ``topic_default_app_id`` configured, the
+        same-chat active-topic-pointer subcommands (new / switch /
+        bind-thread / unbind-thread / list / clear) run. When the flag is
+        off, the legacy Telegram-DM forum-thread handler runs unchanged
+        — preserving fall-through for existing users (charter §
+        Legacy compatibility).
+        """
+        source = event.source
+        # HRM-T0a step 5 + step 8: route to the pointer handler whenever
+        # slash UX + pointer mode are on, even if ``topic_default_app_id``
+        # is missing — the pointer handler returns a user-visible
+        # setup-required message for mutators so the failure mode is
+        # clear, rather than silently falling back to the legacy
+        # Telegram-DM forum-thread handler.
+        if (
+            getattr(self.config, "topic_slash_ux_enabled", False)
+            and getattr(self.config, "topic_pointer_mode_enabled", True)
+        ):
+            return await self._handle_topic_pointer_command(event)
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
             return t("gateway.topic.not_telegram_dm")
         if not self._session_db:
