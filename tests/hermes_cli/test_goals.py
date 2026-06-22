@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -40,23 +41,25 @@ class TestParseJudgeResponse:
     def test_clean_json_done(self):
         from hermes_cli.goals import _parse_judge_response
 
-        done, reason, _ = _parse_judge_response('{"done": true, "reason": "all good"}')
-        assert done is True
+        verdict, reason, _pf, wait = _parse_judge_response('{"done": true, "reason": "all good"}')
+        assert verdict == "done"
         assert reason == "all good"
+        assert wait is None
 
     def test_clean_json_continue(self):
         from hermes_cli.goals import _parse_judge_response
 
-        done, reason, _ = _parse_judge_response('{"done": false, "reason": "more work needed"}')
-        assert done is False
+        verdict, reason, _pf, wait = _parse_judge_response('{"done": false, "reason": "more work needed"}')
+        assert verdict == "continue"
         assert reason == "more work needed"
+        assert wait is None
 
     def test_json_in_markdown_fence(self):
         from hermes_cli.goals import _parse_judge_response
 
         raw = '```json\n{"done": true, "reason": "done"}\n```'
-        done, reason, _ = _parse_judge_response(raw)
-        assert done is True
+        verdict, reason, _pf, _w = _parse_judge_response(raw)
+        assert verdict == "done"
         assert "done" in reason
 
     def test_json_embedded_in_prose(self):
@@ -64,33 +67,79 @@ class TestParseJudgeResponse:
         from hermes_cli.goals import _parse_judge_response
 
         raw = 'Looking at this... the agent says X. Verdict: {"done": false, "reason": "partial"}'
-        done, reason, _ = _parse_judge_response(raw)
-        assert done is False
+        verdict, reason, _pf, _w = _parse_judge_response(raw)
+        assert verdict == "continue"
         assert reason == "partial"
 
     def test_string_done_values(self):
         from hermes_cli.goals import _parse_judge_response
 
         for s in ("true", "yes", "done", "1"):
-            done, _, _ = _parse_judge_response(f'{{"done": "{s}", "reason": "r"}}')
-            assert done is True
+            verdict, _, _, _ = _parse_judge_response(f'{{"done": "{s}", "reason": "r"}}')
+            assert verdict == "done"
         for s in ("false", "no", "not yet"):
-            done, _, _ = _parse_judge_response(f'{{"done": "{s}", "reason": "r"}}')
-            assert done is False
+            verdict, _, _, _ = _parse_judge_response(f'{{"done": "{s}", "reason": "r"}}')
+            assert verdict == "continue"
 
-    def test_malformed_json_fails_open(self):
-        """Non-JSON → not done, with error-ish reason (so judge_goal can map to continue)."""
+    def test_new_verdict_shape(self):
+        """The explicit {"verdict": ...} shape is honored."""
         from hermes_cli.goals import _parse_judge_response
 
-        done, reason, _ = _parse_judge_response("this is not json at all")
-        assert done is False
+        v, _, _, _ = _parse_judge_response('{"verdict": "done", "reason": "r"}')
+        assert v == "done"
+        v, _, _, _ = _parse_judge_response('{"verdict": "continue", "reason": "r"}')
+        assert v == "continue"
+
+    def test_wait_verdict_with_pid(self):
+        from hermes_cli.goals import _parse_judge_response
+
+        v, reason, pf, wait = _parse_judge_response(
+            '{"verdict": "wait", "wait_on_pid": 4242, "reason": "CI running"}'
+        )
+        assert v == "wait"
+        assert pf is False
+        assert wait == {"pid": 4242}
+        assert reason == "CI running"
+
+    def test_wait_verdict_with_seconds(self):
+        from hermes_cli.goals import _parse_judge_response
+
+        v, _, _, wait = _parse_judge_response(
+            '{"verdict": "wait", "wait_for_seconds": 90, "reason": "rate limited"}'
+        )
+        assert v == "wait"
+        assert wait == {"seconds": 90}
+
+    def test_wait_verdict_without_target_downgrades_to_continue(self):
+        """A wait verdict with no pid/seconds can't park on anything → continue."""
+        from hermes_cli.goals import _parse_judge_response
+
+        v, _, pf, wait = _parse_judge_response('{"verdict": "wait", "reason": "vague"}')
+        assert v == "continue"
+        assert wait is None
+        assert pf is False
+
+    def test_unknown_verdict_falls_back_to_continue(self):
+        from hermes_cli.goals import _parse_judge_response
+
+        v, _, _, _ = _parse_judge_response('{"verdict": "maybe", "reason": "r"}')
+        assert v == "continue"
+
+    def test_malformed_json_fails_open(self):
+        """Non-JSON → continue + parse_failed, with error-ish reason."""
+        from hermes_cli.goals import _parse_judge_response
+
+        verdict, reason, parse_failed, _w = _parse_judge_response("this is not json at all")
+        assert verdict == "continue"
+        assert parse_failed is True
         assert reason  # non-empty
 
     def test_empty_response(self):
         from hermes_cli.goals import _parse_judge_response
 
-        done, reason, _ = _parse_judge_response("")
-        assert done is False
+        verdict, reason, parse_failed, _w = _parse_judge_response("")
+        assert verdict == "continue"
+        assert parse_failed is True
         assert reason
 
 
@@ -103,13 +152,13 @@ class TestJudgeGoal:
     def test_empty_goal_skipped(self):
         from hermes_cli.goals import judge_goal
 
-        verdict, _, _ = judge_goal("", "some response")
+        verdict, _, _, _wd = judge_goal("", "some response")
         assert verdict == "skipped"
 
     def test_empty_response_continues(self):
         from hermes_cli.goals import judge_goal
 
-        verdict, _, _ = judge_goal("ship the thing", "")
+        verdict, _, _, _wd = judge_goal("ship the thing", "")
         assert verdict == "continue"
 
     def test_no_aux_client_continues(self):
@@ -120,7 +169,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(None, None),
         ):
-            verdict, _, _ = goals.judge_goal("my goal", "my response")
+            verdict, _, _, _wd = goals.judge_goal("my goal", "my response")
         assert verdict == "continue"
 
     def test_api_error_continues(self):
@@ -133,7 +182,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal("goal", "response")
+            verdict, reason, _, _wd = goals.judge_goal("goal", "response")
         assert verdict == "continue"
         assert "judge error" in reason.lower()
 
@@ -152,7 +201,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal("goal", "agent response")
+            verdict, reason, _, _wd = goals.judge_goal("goal", "agent response")
         assert verdict == "done"
         assert reason == "achieved"
 
@@ -171,7 +220,7 @@ class TestJudgeGoal:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, reason, _ = goals.judge_goal("goal", "agent response")
+            verdict, reason, _, _wd = goals.judge_goal("goal", "agent response")
         assert verdict == "continue"
         assert reason == "not yet"
 
@@ -260,7 +309,7 @@ class TestGoalManager:
         mgr = GoalManager(session_id="eval-sid-1")
         mgr.set("ship it")
 
-        with patch.object(goals, "judge_goal", return_value=("done", "shipped", False)):
+        with patch.object(goals, "judge_goal", return_value=("done", "shipped", False, None)):
             decision = mgr.evaluate_after_turn("I shipped the feature.")
 
         assert decision["verdict"] == "done"
@@ -276,7 +325,7 @@ class TestGoalManager:
         mgr = GoalManager(session_id="eval-sid-2", default_max_turns=5)
         mgr.set("a long goal")
 
-        with patch.object(goals, "judge_goal", return_value=("continue", "more work", False)):
+        with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None)):
             decision = mgr.evaluate_after_turn("made some progress")
 
         assert decision["verdict"] == "continue"
@@ -294,7 +343,7 @@ class TestGoalManager:
         mgr = GoalManager(session_id="eval-sid-3", default_max_turns=2)
         mgr.set("hard goal")
 
-        with patch.object(goals, "judge_goal", return_value=("continue", "not yet", False)):
+        with patch.object(goals, "judge_goal", return_value=("continue", "not yet", False, None)):
             d1 = mgr.evaluate_after_turn("step 1")
             assert d1["should_continue"] is True
             assert mgr.state.turns_used == 1
@@ -371,28 +420,28 @@ class TestJudgeParseFailureAutoPause:
     def test_parse_response_flags_empty_as_parse_failure(self):
         from hermes_cli.goals import _parse_judge_response
 
-        done, reason, parse_failed = _parse_judge_response("")
-        assert done is False
+        verdict, reason, parse_failed, _w = _parse_judge_response("")
+        assert verdict == "continue"
         assert parse_failed is True
         assert "empty" in reason.lower()
 
     def test_parse_response_flags_non_json_as_parse_failure(self):
         from hermes_cli.goals import _parse_judge_response
 
-        done, reason, parse_failed = _parse_judge_response(
+        verdict, reason, parse_failed, _w = _parse_judge_response(
             "Let me analyze whether the goal is fully satisfied based on the agent's response..."
         )
-        assert done is False
+        assert verdict == "continue"
         assert parse_failed is True
         assert "not json" in reason.lower()
 
     def test_parse_response_clean_json_is_not_parse_failure(self):
         from hermes_cli.goals import _parse_judge_response
 
-        done, _, parse_failed = _parse_judge_response(
+        verdict, _, parse_failed, _w = _parse_judge_response(
             '{"done": false, "reason": "more work"}'
         )
-        assert done is False
+        assert verdict == "continue"
         assert parse_failed is False
 
     def test_api_error_does_not_count_as_parse_failure(self):
@@ -405,7 +454,7 @@ class TestJudgeParseFailureAutoPause:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, _, parse_failed = goals.judge_goal("goal", "response")
+            verdict, _, parse_failed, _wd = goals.judge_goal("goal", "response")
         assert verdict == "continue"
         assert parse_failed is False
 
@@ -421,7 +470,7 @@ class TestJudgeParseFailureAutoPause:
             "agent.auxiliary_client.get_text_auxiliary_client",
             return_value=(fake_client, "judge-model"),
         ):
-            verdict, _, parse_failed = goals.judge_goal("goal", "response")
+            verdict, _, parse_failed, _wd = goals.judge_goal("goal", "response")
         assert verdict == "continue"
         assert parse_failed is True
 
@@ -435,7 +484,7 @@ class TestJudgeParseFailureAutoPause:
         mgr.set("do a thing")
 
         with patch.object(
-            goals, "judge_goal", return_value=("continue", "judge returned empty response", True)
+            goals, "judge_goal", return_value=("continue", "judge returned empty response", True, None)
         ):
             d1 = mgr.evaluate_after_turn("step 1")
             assert d1["should_continue"] is True
@@ -464,7 +513,7 @@ class TestJudgeParseFailureAutoPause:
 
         # Two parse failures…
         with patch.object(
-            goals, "judge_goal", return_value=("continue", "not json", True)
+            goals, "judge_goal", return_value=("continue", "not json", True, None)
         ):
             mgr.evaluate_after_turn("step 1")
             mgr.evaluate_after_turn("step 2")
@@ -472,7 +521,7 @@ class TestJudgeParseFailureAutoPause:
 
         # …then one clean reply resets the counter.
         with patch.object(
-            goals, "judge_goal", return_value=("continue", "making progress", False)
+            goals, "judge_goal", return_value=("continue", "making progress", False, None)
         ):
             d = mgr.evaluate_after_turn("step 3")
             assert d["should_continue"] is True
@@ -487,7 +536,7 @@ class TestJudgeParseFailureAutoPause:
         mgr.set("goal")
 
         with patch.object(
-            goals, "judge_goal", return_value=("continue", "judge error: RuntimeError", False)
+            goals, "judge_goal", return_value=("continue", "judge error: RuntimeError", False, None)
         ):
             for _ in range(5):
                 d = mgr.evaluate_after_turn("still going")
@@ -506,7 +555,7 @@ class TestJudgeParseFailureAutoPause:
         mgr.set("persistent goal")
 
         with patch.object(
-            goals, "judge_goal", return_value=("continue", "empty", True)
+            goals, "judge_goal", return_value=("continue", "empty", True, None)
         ):
             mgr.evaluate_after_turn("r")
             mgr.evaluate_after_turn("r")
@@ -714,7 +763,7 @@ class TestJudgeGoalWithSubgoals:
                    return_value=(_FakeClient, "fake-model")), \
              patch("agent.auxiliary_client.get_auxiliary_extra_body",
                    return_value=None):
-            verdict, reason, parse_failed = goals.judge_goal(
+            verdict, reason, parse_failed, _wd = goals.judge_goal(
                 "ship the feature",
                 "ok shipped",
                 subgoals=["write tests", "update docs"],
@@ -826,7 +875,7 @@ class TestWaitBarrier:
             assert mgr.is_waiting() is True
 
             # The judge must NOT be called while parked, and no turn is burned.
-            judge = MagicMock(return_value=("continue", "x", False))
+            judge = MagicMock(return_value=("continue", "x", False, None))
             with patch.object(goals, "judge_goal", judge):
                 decision = mgr.evaluate_after_turn("still waiting on CI")
 
@@ -858,7 +907,7 @@ class TestWaitBarrier:
         assert mgr.is_waiting() is False  # lazy auto-clear
         assert mgr.state.waiting_on_pid is None
 
-        with patch.object(goals, "judge_goal", return_value=("continue", "more", False)):
+        with patch.object(goals, "judge_goal", return_value=("continue", "more", False, None)):
             decision = mgr.evaluate_after_turn("process finished, here are results")
 
         assert decision["verdict"] == "continue"
@@ -875,7 +924,7 @@ class TestWaitBarrier:
         # is_waiting clears the stale barrier immediately.
         assert mgr.is_waiting() is False
 
-        with patch.object(goals, "judge_goal", return_value=("continue", "go", False)):
+        with patch.object(goals, "judge_goal", return_value=("continue", "go", False, None)):
             decision = mgr.evaluate_after_turn("response")
         assert decision["should_continue"] is True
 
@@ -947,3 +996,104 @@ class TestWaitBarrier:
         assert st.waiting_on_pid is None
         assert st.waiting_reason is None
         assert st.waiting_since == 0.0
+        assert st.waiting_until == 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Judge-driven auto-wait — the judge parks the loop on its own
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestJudgeDrivenWait:
+    """The judge returns a `wait` verdict (given live background-process
+    context) and the loop parks automatically — no manual /goal wait."""
+
+    @staticmethod
+    def _spawn_sleeper():
+        import subprocess, sys
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+
+    def test_judge_wait_pid_parks_loop(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        proc = self._spawn_sleeper()
+        try:
+            mgr = GoalManager(session_id="jw-pid", default_max_turns=10)
+            mgr.set("ship the PR")
+            # Judge sees the running process and says wait-on-pid.
+            with patch.object(
+                goals, "judge_goal",
+                return_value=("wait", "CI watcher still running", False, {"pid": proc.pid}),
+            ):
+                decision = mgr.evaluate_after_turn(
+                    "Pushed the PR, watching CI.",
+                    background_processes=[{
+                        "pid": proc.pid, "command": "wait_for_pr_green.sh",
+                        "status": "running", "uptime_seconds": 12,
+                    }],
+                )
+            assert decision["verdict"] == "wait"
+            assert decision["should_continue"] is False
+            assert decision["continuation_prompt"] is None
+            assert mgr.state.waiting_on_pid == proc.pid
+            assert mgr.is_waiting() is True
+
+            # Next turn while still parked: judge must NOT be called again.
+            judge = MagicMock()
+            with patch.object(goals, "judge_goal", judge):
+                d2 = mgr.evaluate_after_turn("still going")
+            judge.assert_not_called()
+            assert d2["verdict"] == "waiting"
+            assert d2["should_continue"] is False
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+
+    def test_judge_wait_seconds_parks_loop(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-secs", default_max_turns=10)
+        mgr.set("retry after backoff")
+        with patch.object(
+            goals, "judge_goal",
+            return_value=("wait", "rate limited", False, {"seconds": 120}),
+        ):
+            decision = mgr.evaluate_after_turn("Hit a 429, backing off.")
+        assert decision["verdict"] == "wait"
+        assert decision["should_continue"] is False
+        assert mgr.state.waiting_until > 0
+        assert mgr.state.waiting_on_pid is None
+        assert mgr.is_waiting() is True
+
+    def test_time_barrier_clears_after_deadline(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-deadline")
+        mgr.set("g")
+        mgr.wait_for_seconds(120, reason="backoff")
+        assert mgr.is_waiting() is True
+        # Force the deadline into the past → barrier auto-clears.
+        mgr.state.waiting_until = time.time() - 1
+        assert mgr.is_waiting() is False
+        assert mgr.state.waiting_until == 0.0
+
+    def test_continue_verdict_still_continues_with_background(self, hermes_home):
+        """A running process present but judge says continue → normal loop."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-cont", default_max_turns=10)
+        mgr.set("do work")
+        with patch.object(
+            goals, "judge_goal",
+            return_value=("continue", "more to do", False, None),
+        ):
+            decision = mgr.evaluate_after_turn(
+                "made progress",
+                background_processes=[{"pid": 999999, "command": "x", "status": "running"}],
+            )
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert mgr.state.waiting_on_pid is None

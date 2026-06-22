@@ -64,20 +64,22 @@ Subgoals are persisted alongside the goal in `SessionDB.state_meta`, so they sur
 
 Use this when you start a loop ("fix the failing tests") and notice partway through that you also want it to "and add a regression test for the bug you just patched" — `/subgoal add a regression test` tightens the success criteria without breaking the running loop.
 
-## Parking on a background process: `/goal wait`
+## Parking on a background process: automatic, with a manual override
 
-Some goals are gated on something that takes minutes and runs on its own — CI on a pushed PR, a long build, a test matrix, a deploy. Without help, the goal loop would re-poke the agent every turn into "is it done yet?" busy-work while it waits.
+Some goals are gated on something that takes minutes and runs on its own — CI on a pushed PR, a long build, a test matrix, a deploy, a rate-limit cooldown. Without help, the goal loop would re-poke the agent every turn into "is it done yet?" busy-work while it waits.
 
-`/goal wait <pid> [reason]` **parks** the loop on a background process. While that PID is alive, the post-turn judge is skipped entirely — no turn is consumed, no continuation prompt is fired, and `/goal status` shows `⏳ Goal (parked on <reason>): <goal>`. The barrier **auto-clears the moment the process exits**, so the next turn resumes normal judging with the process's result in hand. Pair it with a `terminal(background=true, notify_on_complete=true)` watcher: the completion notification is what wakes the session, and by then the barrier is already lifted.
+**This is handled automatically.** Every turn, the judge is shown the agent's live background processes (the `terminal(background=true)` registry — pid, command, uptime, recent output) alongside the goal and the agent's response. When the agent's progress is genuinely gated on one of them, the judge returns a **`wait`** verdict instead of `continue`, and the loop **parks**: the next turns are skipped (no judge call, no continuation, no turn consumed) until the process exits — then it resumes normally with the result in hand. The judge can also park on a **time** basis (`wait_for_seconds`) for backoff/cooldown waits where there's no process to track. `/goal status` shows `⏳ Goal (parked …)` while parked.
+
+You don't type anything for this — it's the judge's decision, made from the process context the loop hands it. The manual commands exist as an override:
 
 | Command | What it does |
 |---|---|
-| `/goal wait <pid> [reason]` | Park the loop until the process with that PID exits. Requires an active goal. |
-| `/goal unwait` | Clear the barrier and resume immediately (e.g. you no longer care about that process). |
+| `/goal wait <pid> [reason]` | Manually park the loop until the process with that PID exits. |
+| `/goal unwait` | Clear any wait barrier (judge- or manually-set) and resume immediately. |
 
-The barrier is persisted with the goal in `SessionDB.state_meta`, so it survives `/resume`. `/goal pause`, `/goal resume`, and `/goal clear` all drop it. If the PID is already dead when you set it (or dies while parked), the barrier clears on the next check — a stale barrier can never wedge the loop.
+The barrier (pid- or time-based) is persisted with the goal in `SessionDB.state_meta`, so it survives `/resume`. `/goal pause`, `/goal resume`, and `/goal clear` all drop it. If the PID is already dead when the barrier is set (or dies while parked), or the time deadline passes, the barrier clears on the next check — a stale barrier can never wedge the loop.
 
-Typical flow: push a PR, start a CI watcher in the background, then `/goal wait <watcher-pid> CI green` — Hermes goes quiet instead of spinning, and picks back up the instant CI finishes.
+Typical flow: the agent pushes a PR, starts a CI watcher with `terminal(background=true, notify_on_complete=true)`, and reports "watching CI." The judge sees the watcher process still running, returns `wait` on its pid, and the loop goes quiet — then picks back up the instant CI finishes and judges the goal against the actual result.
 
 ## Behavior details
 
