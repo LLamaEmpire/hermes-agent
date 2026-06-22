@@ -349,38 +349,27 @@ def _truncate(text: str, limit: int) -> str:
 def _pid_alive(pid: int) -> bool:
     """Return True if a process with ``pid`` is currently alive.
 
-    Cross-platform: prefers ``psutil`` when available (handles Windows and
-    avoids the zombie-counts-as-alive quirk), falls back to POSIX
-    ``os.kill(pid, 0)``. Any error resolves to False (treat unknown as dead)
-    so a stale barrier never wedges the loop — the worst case is the goal
-    resumes one turn early, which is safe.
+    Delegates to ``gateway.status._pid_exists`` — the canonical,
+    cross-platform, footgun-safe liveness check (psutil with a ctypes /
+    POSIX fallback). Critically this avoids ``os.kill(pid, 0)``, which on
+    Windows is NOT a no-op: it routes to ``CTRL_C_EVENT`` and hard-kills the
+    target's console process group (bpo-14484). Any error resolves to False
+    (treat unknown as dead) so a stale barrier never wedges the loop — the
+    worst case is the goal resumes one turn early, which is safe.
     """
     if not pid or pid <= 0:
         return False
     try:
-        import psutil  # type: ignore
+        from gateway.status import _pid_exists
 
-        if not psutil.pid_exists(pid):
-            return False
-        try:
-            proc = psutil.Process(pid)
-            # A zombie/dead process is effectively done — treat as not alive.
-            return proc.status() != psutil.STATUS_ZOMBIE
-        except Exception:
-            return False
+        return bool(_pid_exists(int(pid)))
     except Exception:
         pass
-    # Fallback: POSIX signal-0 liveness probe.
+    # Last-resort fallback if gateway.status is unavailable: psutil directly.
     try:
-        import os
+        import psutil  # type: ignore
 
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Exists but owned by another user — alive for our purposes.
-        return True
+        return bool(psutil.pid_exists(int(pid)))
     except Exception:
         return False
 
