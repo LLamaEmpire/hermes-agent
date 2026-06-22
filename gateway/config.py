@@ -574,6 +574,11 @@ class GatewayConfig:
     # — when False the legacy Telegram-DM forum-thread ``/topic`` handler
     # runs unchanged, preserving fall-through for existing users.
     topic_slash_ux_enabled: bool = False
+    # HRM-T0a registry checker: directory that holds <app_id>.json registry
+    # files.  When None, the gateway defaults to <hermes_home>/registry.
+    # Set this in config.yaml under ``topic.registry_root`` only when the
+    # default is wrong for your layout — not a secret, so config.yaml not env.
+    topic_registry_root: Optional[str] = None
 
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
@@ -683,6 +688,7 @@ class GatewayConfig:
                 "pointer_mode_enabled": self.topic_pointer_mode_enabled,
                 "default_app_id": self.topic_default_app_id,
                 "slash_ux_enabled": self.topic_slash_ux_enabled,
+                "registry_root": self.topic_registry_root,
             },
         }
     
@@ -771,6 +777,10 @@ class GatewayConfig:
         topic_slash_ux_enabled_raw = data.get("topic_slash_ux_enabled")
         if topic_slash_ux_enabled_raw is None:
             topic_slash_ux_enabled_raw = topic_block.get("slash_ux_enabled")
+        topic_registry_root_raw = data.get("topic_registry_root")
+        if topic_registry_root_raw is None:
+            topic_registry_root_raw = topic_block.get("registry_root")
+        topic_registry_root = str(topic_registry_root_raw) if topic_registry_root_raw else None
 
         return cls(
             platforms=platforms,
@@ -799,6 +809,7 @@ class GatewayConfig:
             topic_slash_ux_enabled=_coerce_bool(
                 topic_slash_ux_enabled_raw, False
             ),
+            topic_registry_root=topic_registry_root,
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
