@@ -417,6 +417,136 @@ async def clear_active_topic(
         )
 
 
+# ── Per-thread app binding helpers ────────────────────────────────────────
+#
+# App bindings map (platform, user_id, chat_id, thread_id) → app_id and are
+# stored in the ``app_binding`` table in SessionDB.  They let individual
+# Telegram threads bind to a different app than the gateway-level default.
+
+
+def _binding_source_parts(source: Any) -> Tuple[str, str, str, str]:
+    """Extract (platform_str, user_id, chat_id, thread_id) from source.
+
+    Raises ValueError for missing required fields, same semantics as
+    :meth:`PlatformPrincipal.from_source`.
+    """
+    platform_attr = getattr(source, "platform", None)
+    if platform_attr is None:
+        raise ValueError("source.platform is required for app binding")
+    platform_str = getattr(platform_attr, "value", None) or str(platform_attr)
+    user_id = getattr(source, "user_id", None)
+    chat_id = getattr(source, "chat_id", None)
+    thread_id = getattr(source, "thread_id", None)
+    if not user_id:
+        raise ValueError("source.user_id is required for app binding")
+    if not chat_id:
+        raise ValueError("source.chat_id is required for app binding")
+    return (
+        str(platform_str),
+        str(user_id),
+        str(chat_id),
+        str(thread_id) if thread_id else "",
+    )
+
+
+async def read_app_binding_for_source(
+    session_db: Any,
+    source: Any,
+) -> Optional[str]:
+    """Return the bound app_id for this thread, or ``None``. Never raises."""
+    try:
+        platform_str, user_id, chat_id, thread_id = _binding_source_parts(source)
+    except ValueError:
+        return None
+    try:
+        return await asyncio.to_thread(
+            session_db.read_app_binding,
+            platform=platform_str,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("read_app_binding_for_source failed", exc_info=True)
+        return None
+
+
+async def set_app_binding_for_source(
+    session_db: Any,
+    source: Any,
+    *,
+    app_id: str,
+    updated_by: str,
+) -> Dict[str, Any]:
+    """Set the per-thread app binding. Returns ``{"prior": …, "app_id": …}``."""
+    platform_str, user_id, chat_id, thread_id = _binding_source_parts(source)
+    return await asyncio.to_thread(
+        session_db.set_app_binding,
+        platform=platform_str,
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        app_id=app_id,
+        updated_by=updated_by,
+    )
+
+
+async def clear_app_binding_for_source(
+    session_db: Any,
+    source: Any,
+    *,
+    updated_by: str,
+) -> Optional[str]:
+    """Clear the per-thread app binding. Returns prior app_id, or ``None``."""
+    try:
+        platform_str, user_id, chat_id, thread_id = _binding_source_parts(source)
+    except ValueError:
+        return None
+    return await asyncio.to_thread(
+        session_db.clear_app_binding,
+        platform=platform_str,
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        updated_by=updated_by,
+    )
+
+
+async def resolve_effective_app_id(
+    session_db: Any,
+    source: Any,
+    *,
+    default_app_id: Optional[str],
+) -> Optional[str]:
+    """Return the effective app_id: per-thread binding overrides gateway default."""
+    bound = await read_app_binding_for_source(session_db, source)
+    return bound or default_app_id
+
+
+def resolve_effective_app_id_sync(
+    session_db: Any,
+    source: Any,
+    *,
+    default_app_id: Optional[str],
+) -> Optional[str]:
+    """Sync variant of :func:`resolve_effective_app_id`."""
+    try:
+        platform_str, user_id, chat_id, thread_id = _binding_source_parts(source)
+    except ValueError:
+        return default_app_id
+    try:
+        bound = session_db.read_app_binding(
+            platform=platform_str,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        return bound or default_app_id
+    except Exception:  # noqa: BLE001
+        logger.debug("resolve_effective_app_id_sync failed", exc_info=True)
+        return default_app_id
+
+
 # ── Inbound routing pre-pass (step 4) ─────────────────────────────────
 #
 # The routing pre-pass is the inbound-message read of the pointer. It
@@ -995,40 +1125,100 @@ _NL_TOPIC_STATUS_RE = re.compile(
     r"(?:\s+(?:for\s+)?(?:here|this(?:\s+thread)?))?)\s*$",
     re.IGNORECASE,
 )
+_NL_APP_SET_RE = re.compile(
+    r"^\s*(?:set|switch|bind|change)\s+app\s+to\s+(\S+)\s*$",
+    re.IGNORECASE,
+)
+_NL_APP_STATUS_RE = re.compile(
+    r"^\s*(?:app\s+status|what(?:'?s|\s+is)?\s+(?:the\s+)?(?:current\s+)?app"
+    r"(?:\s+(?:here|for\s+this(?:\s+thread)?))?)\s*$",
+    re.IGNORECASE,
+)
+_NL_LIST_TOPICS_RE = re.compile(
+    r"^\s*(?:list|show)\s+topics?(?:\s+in\s+(\S+))?\s*$",
+    re.IGNORECASE,
+)
+_NL_CREATE_TOPIC_RE = re.compile(
+    r"^\s*(?:create|add)\s+topic\s+(\S+)\s*$",
+    re.IGNORECASE,
+)
+_NL_SUGGEST_TOPICS_RE = re.compile(
+    r"^\s*(?:suggest|propose)\s+topics?\s*$",
+    re.IGNORECASE,
+)
 
 
 def parse_telegram_topic_directive(
     text: str,
 ) -> Optional[Tuple[str, Optional[str]]]:
-    """Parse a natural-language topic directive.
+    """Parse a natural-language topic or app directive.
 
-    Returns ``(command, topic_id)`` or ``None`` if the text is not a
-    recognized directive. ``command`` is one of ``"set"``, ``"clear"``,
-    ``"status"``. ``topic_id`` is present only for ``"set"``.
+    Returns ``(command, value)`` or ``None`` if the text is not a recognized
+    directive.  Commands and their ``value``:
 
-    Recognized phrases:
-    - "set|switch|change topic to <topic>"
-    - "topic <topic>"  (bare topic-name shortcut)
-    - "clear|reset topic"
-    - "topic status"
-    - "what('s| is) (the|active) topic (for here|for this thread|here|…)"
+    - ``"set"`` / ``value=topic_id`` — "set|switch|change topic to <topic>"
+      or "topic <topic>".  Plain topic-id (no ``/``).
+    - ``"set_qualified"`` / ``value="app_id/topic_id"`` — "set topic to
+      app/topic" with a ``/``; caller splits on first ``/``.
+    - ``"clear"`` / ``None`` — "clear|reset topic"
+    - ``"status"`` / ``None`` — "topic status" / "what's the topic"
+    - ``"set_app"`` / ``value=app_id`` — "set|switch|bind|change app to X"
+    - ``"app_status"`` / ``None`` — "app status" / "what's the app"
+    - ``"list_topics"`` / ``value=app_id_or_None`` — "list|show topics [in X]"
+    - ``"create_topic"`` / ``value=topic_or_qualified`` — "create|add topic X"
+    - ``"suggest_topics"`` / ``None`` — "suggest|propose topics"
     """
     if not text:
         return None
     s = text.strip()
+
+    # "set|switch|change topic to X" — qualified (app/topic) or plain
     m = _NL_TOPIC_SET_RE.match(s)
     if m:
-        return ("set", m.group(1).lower())
+        val = m.group(1).lower()
+        if "/" in val:
+            return ("set_qualified", val)
+        return ("set", val)
+
+    # "topic X" — bare topic-name shortcut
     m = _NL_TOPIC_BARE_RE.match(s)
     if m:
         candidate = m.group(1).lower()
-        # Exclude bare "topic status" — caught by the status regex.
-        if candidate != "status":
-            return ("set", candidate)
+        if candidate == "status":
+            return ("status", None)
+        if "/" in candidate:
+            return ("set_qualified", candidate)
+        return ("set", candidate)
+
+    # App binding commands
+    m = _NL_APP_SET_RE.match(s)
+    if m:
+        return ("set_app", m.group(1).lower())
+    if _NL_APP_STATUS_RE.match(s):
+        return ("app_status", None)
+
+    # List topics
+    m = _NL_LIST_TOPICS_RE.match(s)
+    if m:
+        return ("list_topics", m.group(1).lower() if m.group(1) else None)
+
+    # Create topic
+    m = _NL_CREATE_TOPIC_RE.match(s)
+    if m:
+        return ("create_topic", m.group(1).lower())
+
+    # Suggest topics
+    if _NL_SUGGEST_TOPICS_RE.match(s):
+        return ("suggest_topics", None)
+
+    # Clear/reset topic
     if _NL_TOPIC_CLEAR_RE.match(s):
         return ("clear", None)
+
+    # Topic status
     if _NL_TOPIC_STATUS_RE.match(s):
         return ("status", None)
+
     return None
 
 
@@ -1039,30 +1229,30 @@ async def handle_telegram_topic_directive(
     app_id: str,
     text: str,
     updated_by: str = "telegram:nl_directive",
+    registry_root: Optional[Any] = None,
 ) -> Optional[str]:
-    """Handle a natural-language topic directive from a Telegram surface.
+    """Handle a natural-language topic/app directive from a Telegram surface.
 
     Returns a reply string when *text* is a recognized directive, or
     ``None`` if it is not. The caller must NOT send the text to the agent
     runner when a non-None reply is returned.
 
-    Operates on the per-thread pointer: if ``source.thread_id`` is set
-    the write/read is scoped to that Telegram forum thread; otherwise
-    it falls back to the whole-chat (thread_id="") pointer.
+    ``app_id`` is the gateway-level default; per-thread bindings stored in
+    SessionDB may override it.  ``registry_root`` (Path or str) is required
+    for list-topics and create-topic commands; if ``None`` those commands
+    return an informative error rather than crashing.
     """
     directive = parse_telegram_topic_directive(text)
     if directive is None:
         return None
-    command, topic_id = directive
+    command, value = directive
 
+    # Validate source identity before touching any state.
     try:
-        principal = PlatformPrincipal.from_source(source, app_id=app_id)
+        _binding_source_parts(source)
     except ValueError as exc:
-        # Source is incomplete (e.g. user_id=None from group observe-attribution
-        # rewrite). Returning None here would let a recognized directive leak to
-        # the agent runner — return an error reply instead so the preempt holds.
         logger.debug(
-            "NL topic directive: principal assembly failed for directive %r: %s",
+            "NL topic directive: source missing required fields for %r: %s",
             command, exc,
         )
         return (
@@ -1070,8 +1260,163 @@ async def handle_telegram_topic_directive(
             "(incomplete sender context — please try again)."
         )
 
-    if command == "set":
-        assert topic_id is not None  # invariant: "set" always has topic_id
+    # Resolve effective app_id: per-thread binding overrides gateway default.
+    effective_app_id = await resolve_effective_app_id(
+        session_db, source, default_app_id=app_id
+    )
+
+    # ── set_app ────────────────────────────────────────────────────────────
+    if command == "set_app":
+        target_app = value or ""
+        if not target_app:
+            return "App ID is required. Usage: 'set app to development-os'"
+        if registry_root is not None:
+            from gateway.topic_registry import list_topics_in_registry
+            try:
+                list_topics_in_registry(registry_root, target_app)
+            except ValueError as exc:
+                return f'App "{target_app}" not found: {exc}. Check the app ID and try again.'
+        result = await set_app_binding_for_source(
+            session_db, source, app_id=target_app, updated_by=updated_by
+        )
+        prior = result.get("prior")
+        if prior == target_app:
+            return f'App is already bound to "{target_app}" for this thread.'
+        elif prior:
+            return f'App switched from "{prior}" to "{target_app}" for this thread.'
+        return f'App bound to "{target_app}" for this thread.'
+
+    # ── app_status ──────────────────────────────────────────────────────────
+    elif command == "app_status":
+        binding = await read_app_binding_for_source(session_db, source)
+        display_app = effective_app_id or "(not configured)"
+        source_label = " (per-thread)" if binding else " (gateway default)"
+        topic_part = ""
+        if effective_app_id:
+            try:
+                principal = PlatformPrincipal.from_source(source, app_id=effective_app_id)
+                row = await read_active_topic(session_db, principal)
+                if row:
+                    topic_part = f', topic: "{row["topic_id"]}"'
+                else:
+                    topic_part = ", topic: (none)"
+            except Exception:  # noqa: BLE001
+                pass
+        return f'App: "{display_app}"{source_label}{topic_part}.'
+
+    # ── set_qualified ("set topic to app/topic") ────────────────────────────
+    elif command == "set_qualified":
+        assert value is not None
+        if "/" not in value:
+            return f'Expected "app/topic" format, got "{value}".'
+        target_app, target_topic = value.split("/", 1)
+        if not target_app or not target_topic:
+            return f'Expected "app/topic" format, got "{value}".'
+        # Validate the topic exists in the target app.
+        if registry_root is not None:
+            from gateway.topic_registry import list_topics_in_registry
+            try:
+                topics = list_topics_in_registry(registry_root, target_app)
+            except ValueError as exc:
+                return f'App "{target_app}" not found: {exc}. Check app ID and try again.'
+            if target_topic not in topics:
+                return (
+                    f'Topic "{target_topic}" is not registered under app "{target_app}". '
+                    f'Use "list topics in {target_app}" to see available topics.'
+                )
+        else:
+            try:
+                await assert_registered(target_app, target_topic)
+            except TopicNotRegisteredError as exc:
+                msg = str(exc)
+                if "no registry checker wired" in msg:
+                    return "Topic registry is not configured — cannot set topic."
+                return (
+                    f'Topic "{target_topic}" not registered under app "{target_app}". '
+                    f'Check the registered topics and try again.'
+                )
+        # Atomically set app binding + topic pointer.
+        await set_app_binding_for_source(
+            session_db, source, app_id=target_app, updated_by=updated_by
+        )
+        try:
+            principal = PlatformPrincipal.from_source(source, app_id=target_app)
+        except ValueError:
+            return "Topic directive could not be processed (incomplete sender context)."
+        result = await set_active_topic(
+            session_db,
+            principal,
+            topic_id=target_topic,
+            bound_thread_id=principal.thread_id or None,
+            updated_by=updated_by,
+            require_registered=False,  # already validated above
+        )
+        prior = result.get("prior")
+        if prior and prior.get("topic_id") == target_topic and effective_app_id == target_app:
+            return f'App "{target_app}", topic "{target_topic}" — already set for this thread.'
+        return f'Switched to app "{target_app}", topic "{target_topic}" for this thread.'
+
+    # ── list_topics ─────────────────────────────────────────────────────────
+    elif command == "list_topics":
+        target_app = value or effective_app_id
+        if not target_app:
+            return 'No app configured for this thread. Use "set app to <app-id>" first.'
+        if registry_root is None:
+            return f'Topic registry path not configured — cannot list topics for "{target_app}".'
+        from gateway.topic_registry import list_topics_in_registry
+        try:
+            topics = list_topics_in_registry(registry_root, target_app)
+        except ValueError as exc:
+            return f'Cannot list topics for "{target_app}": {exc}'
+        if not topics:
+            return f'No topics registered under "{target_app}".'
+        topic_lines = "\n".join(f"  • {t}" for t in topics)
+        return f'Topics in "{target_app}":\n{topic_lines}'
+
+    # ── create_topic ─────────────────────────────────────────────────────────
+    elif command == "create_topic":
+        assert value is not None
+        if "/" in value:
+            target_app, target_topic = value.split("/", 1)
+        else:
+            target_app = effective_app_id
+            target_topic = value
+        if not target_app:
+            return 'No app configured for this thread. Use "set app to <app-id>" first.'
+        if registry_root is None:
+            return "Topic registry path not configured — cannot create topics."
+        from gateway.topic_registry import add_topic_to_registry
+        try:
+            result = add_topic_to_registry(registry_root, target_app, target_topic)
+        except ValueError as exc:
+            return f'Cannot create topic "{target_topic}": {exc}'
+        except Exception:  # noqa: BLE001
+            logger.debug("create_topic failed", exc_info=True)
+            return f'Failed to create topic "{target_topic}" — check registry and try again.'
+        if result["created"]:
+            return f'Topic "{target_topic}" created in app "{target_app}".'
+        return f'Topic "{target_topic}" already exists in app "{target_app}".'
+
+    # ── suggest_topics ───────────────────────────────────────────────────────
+    elif command == "suggest_topics":
+        return (
+            "Topic suggestion (proposal only — no messages moved or split):\n"
+            "Full session-history analysis is not available at the directive layer. "
+            "Ask the agent directly: \"What topics should I create for this discussion?\"\n"
+            "Moving/splitting history into topics is a follow-up step."
+        )
+
+    # ── existing: set (plain topic, current app) ─────────────────────────────
+    elif command == "set":
+        assert value is not None
+        topic_id = value
+        if not effective_app_id:
+            return 'No app configured for this thread. Use "set app to <app-id>" first.'
+        try:
+            principal = PlatformPrincipal.from_source(source, app_id=effective_app_id)
+        except ValueError as exc:
+            logger.debug("NL topic directive: principal assembly failed for 'set': %s", exc)
+            return "Topic directive could not be processed (incomplete sender context)."
         try:
             result = await set_active_topic(
                 session_db,
@@ -1084,31 +1429,38 @@ async def handle_telegram_topic_directive(
         except TopicNotRegisteredError as exc:
             msg = str(exc)
             if "no registry checker wired" in msg:
-                return (
-                    f'Topic registry is not configured — cannot set topic to "{topic_id}".'
-                )
-            return (
-                f'Unknown topic "{topic_id}". '
-                f"Check the registered topics and try again."
-            )
+                return f'Topic registry is not configured — cannot set topic to "{topic_id}".'
+            return f'Unknown topic "{topic_id}". Check the registered topics and try again.'
         prior = result.get("prior")
         if prior and prior.get("topic_id") == topic_id:
             return f'Topic is already "{topic_id}" for this thread.'
         elif prior:
-            return (
-                f'Switched topic from "{prior["topic_id"]}" to "{topic_id}".'
-            )
+            return f'Switched topic from "{prior["topic_id"]}" to "{topic_id}".'
         return f'Topic set to "{topic_id}" for this thread.'
 
+    # ── existing: clear ────────────────────────────────────────────────────
     elif command == "clear":
-        prior = await clear_active_topic(
-            session_db, principal, updated_by=updated_by
-        )
+        if not effective_app_id:
+            return 'No app configured for this thread.'
+        try:
+            principal = PlatformPrincipal.from_source(source, app_id=effective_app_id)
+        except ValueError as exc:
+            logger.debug("NL topic directive: principal assembly failed for 'clear': %s", exc)
+            return "Topic directive could not be processed (incomplete sender context)."
+        prior = await clear_active_topic(session_db, principal, updated_by=updated_by)
         if prior:
             return f'Cleared topic "{prior["topic_id"]}" for this thread.'
         return "No active topic to clear for this thread."
 
+    # ── existing: status ────────────────────────────────────────────────────
     elif command == "status":
+        if not effective_app_id:
+            return "No app configured — no active topic set for this thread."
+        try:
+            principal = PlatformPrincipal.from_source(source, app_id=effective_app_id)
+        except ValueError as exc:
+            logger.debug("NL topic directive: principal assembly failed for 'status': %s", exc)
+            return "Topic directive could not be processed (incomplete sender context)."
         row = await read_active_topic(session_db, principal)
         if row:
             return f'Active topic for this thread: "{row["topic_id"]}".'

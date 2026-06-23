@@ -921,13 +921,30 @@ class SessionStore:
         *,
         profile: Optional[str],
     ) -> Optional[str]:
-        """Async pre-pass wrapper — locked routing read for the live path."""
+        """Async pre-pass wrapper — locked routing read for the live path.
+
+        Per-thread app binding is consulted before the gateway-level
+        ``topic_default_app_id``; different Telegram threads can bind to
+        different apps without changing the global config.
+        """
         if not getattr(self.config, "topic_pointer_mode_enabled", True):
             return None
-        app_id = getattr(self.config, "topic_default_app_id", None)
-        if not app_id:
-            return None
         if self._db is None:
+            return None
+        default_app_id = getattr(self.config, "topic_default_app_id", None)
+        # Per-thread app binding overrides gateway default.
+        try:
+            from gateway.active_topic import resolve_effective_app_id
+            app_id = await resolve_effective_app_id(
+                self._db, source, default_app_id=default_app_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "resolve_effective_app_id failed; using default app_id",
+                exc_info=True,
+            )
+            app_id = default_app_id
+        if not app_id:
             return None
         try:
             from gateway.active_topic import resolve_topic_session_key_async
@@ -954,16 +971,27 @@ class SessionStore:
     ) -> Optional[str]:
         """HRM-T0a pre-pass — return topic-routed session key, or ``None``.
 
-        Wraps :func:`gateway.active_topic.resolve_topic_session_key` so the
-        SessionStore call site stays small. Imported lazily to avoid
-        circular imports between ``gateway.active_topic`` and this module.
+        Per-thread app binding is consulted before the gateway-level default.
+        Imported lazily to avoid circular imports.
         """
         if not getattr(self.config, "topic_pointer_mode_enabled", True):
             return None
-        app_id = getattr(self.config, "topic_default_app_id", None)
-        if not app_id:
-            return None
         if self._db is None:
+            return None
+        default_app_id = getattr(self.config, "topic_default_app_id", None)
+        # Per-thread app binding overrides gateway default (sync variant).
+        try:
+            from gateway.active_topic import resolve_effective_app_id_sync
+            app_id = resolve_effective_app_id_sync(
+                self._db, source, default_app_id=default_app_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "resolve_effective_app_id_sync failed; using default app_id",
+                exc_info=True,
+            )
+            app_id = default_app_id
+        if not app_id:
             return None
         try:
             from gateway.active_topic import resolve_topic_session_key

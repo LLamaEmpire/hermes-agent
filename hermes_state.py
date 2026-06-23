@@ -5425,6 +5425,151 @@ class SessionDB:
             }
         return self._execute_write(_do)
 
+    # ── app_binding: per-thread app overrides ─────────────────────────────
+
+    def apply_app_binding_migration(self) -> None:
+        """Create app_binding table on first explicit use.
+
+        Schema:
+          app_binding — per-thread app override keyed by
+            (platform, user_id, chat_id, thread_id) → app_id.
+            Allows individual Telegram forum threads (or other thread surfaces)
+            to route to a different app registry than the gateway default.
+
+        Idempotent: safe to call repeatedly.
+        """
+        def _do(conn):
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS app_binding (
+                    platform    TEXT NOT NULL,
+                    user_id     TEXT NOT NULL,
+                    chat_id     TEXT NOT NULL,
+                    thread_id   TEXT NOT NULL DEFAULT '',
+                    app_id      TEXT NOT NULL,
+                    updated_at  REAL NOT NULL,
+                    updated_by  TEXT NOT NULL,
+                    PRIMARY KEY (platform, user_id, chat_id, thread_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_app_binding_app
+                    ON app_binding (app_id);
+                """
+            )
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("app_binding_schema_version", "1"),
+            )
+        self._execute_write(_do)
+
+    def read_app_binding(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        chat_id: str,
+        thread_id: str = "",
+    ) -> Optional[str]:
+        """Return the bound app_id for (platform, user_id, chat_id, thread_id), or None.
+
+        Read-only: does NOT trigger the app_binding migration. Returns None
+        if the table hasn't been created yet (before any set_app_binding call).
+        """
+        tid = str(thread_id) if thread_id is not None else ""
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT app_id FROM app_binding
+                    WHERE platform = ? AND user_id = ? AND chat_id = ? AND thread_id = ?
+                    """,
+                    (str(platform), str(user_id), str(chat_id), tid),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+        if row is None:
+            return None
+        return row["app_id"] if isinstance(row, sqlite3.Row) else row[0]
+
+    def set_app_binding(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        chat_id: str,
+        thread_id: str = "",
+        app_id: str,
+        updated_by: str,
+    ) -> Dict[str, Any]:
+        """Upsert the per-thread app binding.
+
+        Returns ``{"prior": <prior_app_id_or_None>, "app_id": <new_app_id>}``.
+        Triggers the app_binding migration on first call.
+        """
+        if not app_id:
+            raise ValueError("app_id is required")
+        if not updated_by:
+            raise ValueError("updated_by is required")
+        self.apply_app_binding_migration()
+        now = time.time()
+        tid = str(thread_id) if thread_id is not None else ""
+
+        def _do(conn):
+            prior_row = conn.execute(
+                "SELECT app_id FROM app_binding "
+                "WHERE platform = ? AND user_id = ? AND chat_id = ? AND thread_id = ?",
+                (str(platform), str(user_id), str(chat_id), tid),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO app_binding
+                    (platform, user_id, chat_id, thread_id, app_id, updated_at, updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, user_id, chat_id, thread_id) DO UPDATE SET
+                    app_id = excluded.app_id,
+                    updated_at = excluded.updated_at,
+                    updated_by = excluded.updated_by
+                """,
+                (str(platform), str(user_id), str(chat_id), tid, str(app_id), now, str(updated_by)),
+            )
+            prior = None
+            if prior_row is not None:
+                prior = prior_row["app_id"] if isinstance(prior_row, sqlite3.Row) else prior_row[0]
+            return {"prior": prior, "app_id": str(app_id)}
+        return self._execute_write(_do)
+
+    def clear_app_binding(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        chat_id: str,
+        thread_id: str = "",
+        updated_by: str,
+    ) -> Optional[str]:
+        """Delete the per-thread app binding. Returns the prior app_id, or None."""
+        if not updated_by:
+            raise ValueError("updated_by is required")
+        self.apply_app_binding_migration()
+        tid = str(thread_id) if thread_id is not None else ""
+
+        def _do(conn):
+            prior_row = conn.execute(
+                "SELECT app_id FROM app_binding "
+                "WHERE platform = ? AND user_id = ? AND chat_id = ? AND thread_id = ?",
+                (str(platform), str(user_id), str(chat_id), tid),
+            ).fetchone()
+            conn.execute(
+                "DELETE FROM app_binding "
+                "WHERE platform = ? AND user_id = ? AND chat_id = ? AND thread_id = ?",
+                (str(platform), str(user_id), str(chat_id), tid),
+            )
+            if prior_row is None:
+                return None
+            return prior_row["app_id"] if isinstance(prior_row, sqlite3.Row) else prior_row[0]
+        return self._execute_write(_do)
+
     # ── session-move primitive ──────────────────────────────────────────
 
     def _resolve_move_range(

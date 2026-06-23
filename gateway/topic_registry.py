@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import tempfile
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +98,112 @@ def make_json_registry_checker(
         return topic_id in topics
 
     return _check
+
+
+# ── Mutable registry helpers ──────────────────────────────────────────────
+
+TOPIC_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def list_topics_in_registry(
+    registry_root: Path,
+    app_id: str,
+) -> List[str]:
+    """Return a sorted list of topic_ids from the registry file for *app_id*.
+
+    Raises on any failure (missing file, malformed JSON, schema mismatch) so
+    callers can give the user a concrete error message.
+    """
+    registry_file = Path(registry_root) / f"{app_id}.json"
+    try:
+        text = registry_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise ValueError(f"no registry file for app {app_id!r} at {registry_file}")
+    except OSError as exc:
+        raise ValueError(f"cannot read {registry_file}: {exc}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed JSON in {registry_file}: {exc}")
+    if not isinstance(data, dict):
+        raise ValueError(f"registry {registry_file} root is not a JSON object")
+    if data.get("app_id") != app_id:
+        raise ValueError(
+            f"registry {registry_file} declares app_id {data.get('app_id')!r}, "
+            f"expected {app_id!r}"
+        )
+    topics = data.get("topics")
+    if not isinstance(topics, dict):
+        raise ValueError(f"registry {registry_file} 'topics' field is not a JSON object")
+    return sorted(topics.keys())
+
+
+def add_topic_to_registry(
+    registry_root: Path,
+    app_id: str,
+    topic_id: str,
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Add *topic_id* to the registry file for *app_id* atomically.
+
+    Idempotent: if *topic_id* already exists the file is not written and the
+    return value has ``"created": False``.  On success: ``"created": True``.
+
+    Raises :exc:`ValueError` for invalid slugs, missing files, or schema
+    mismatches — never silently corrupts the registry.
+
+    Safety:
+    - Write constrained to ``<registry_root>/<app_id>.json`` — no path
+      traversal because ``app_id`` is validated against the file's own field.
+    - Slug must match :data:`TOPIC_SLUG_RE` (``[a-z0-9][a-z0-9_-]*``).
+    - Atomic write: temp file in same dir, then ``os.replace()``.
+    """
+    if not TOPIC_SLUG_RE.match(topic_id):
+        raise ValueError(
+            f"invalid topic slug {topic_id!r}: must match [a-z0-9][a-z0-9_-]* "
+            "(lowercase, digits, hyphens, underscores only)"
+        )
+    registry_file = Path(registry_root) / f"{app_id}.json"
+    try:
+        text = registry_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise ValueError(f"no registry file for app {app_id!r} at {registry_file}")
+    except OSError as exc:
+        raise ValueError(f"cannot read {registry_file}: {exc}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed JSON in {registry_file}: {exc}")
+    if not isinstance(data, dict):
+        raise ValueError(f"registry {registry_file} root is not a JSON object")
+    if data.get("app_id") != app_id:
+        raise ValueError(
+            f"registry {registry_file} declares app_id {data.get('app_id')!r}, "
+            f"expected {app_id!r}"
+        )
+    topics = data.get("topics")
+    if not isinstance(topics, dict):
+        raise ValueError(f"registry {registry_file} 'topics' field is not a JSON object")
+    if topic_id in topics:
+        return {"created": False, "app_id": app_id, "topic_id": topic_id}
+    data["topics"][topic_id] = metadata or {}
+    parent = registry_file.parent
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=str(parent), prefix=f".{app_id}.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp_path, str(registry_file))
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return {"created": True, "app_id": app_id, "topic_id": topic_id}
 
 
 def make_multi_app_registry_checker(
