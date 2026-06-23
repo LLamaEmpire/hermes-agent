@@ -3,9 +3,11 @@ SQLite-backed fact store with entity resolution and trust scoring.
 Single-user Hermes memory store plugin.
 """
 
+import random
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 try:
@@ -95,6 +97,27 @@ def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
 
 
+# Shared per-db-path RLock registry — all MemoryStore instances for the same
+# db file within a process share one lock, preventing intra-process convoy
+# that causes "database is locked" when multiple gateway provider instances
+# open the same memory_store.db concurrently.
+_db_lock_registry: dict[str, threading.RLock] = {}
+_db_lock_registry_mu = threading.Lock()
+
+_WRITE_MAX_RETRIES = 10
+_WRITE_RETRY_MIN_S = 0.020   # 20 ms
+_WRITE_RETRY_MAX_S = 0.150   # 150 ms
+_BUSY_TIMEOUT_MS   = 5_000   # 5 s — SQLite-level wait before SQLITE_BUSY
+
+
+def _get_db_lock(db_path: "Path") -> threading.RLock:
+    key = str(db_path.resolve())
+    with _db_lock_registry_mu:
+        if key not in _db_lock_registry:
+            _db_lock_registry[key] = threading.RLock()
+        return _db_lock_registry[key]
+
+
 class MemoryStore:
     """SQLite-backed fact store with entity resolution and trust scoring."""
 
@@ -117,7 +140,10 @@ class MemoryStore:
             check_same_thread=False,
             timeout=10.0,
         )
-        self._lock = threading.RLock()
+        # Shared lock: all instances for the same db file in this process
+        # serialise through a single RLock so concurrent gateway providers
+        # cannot deadlock each other at the Python level.
+        self._lock = _get_db_lock(self.db_path)
         self._conn.row_factory = sqlite3.Row
         self._init_db()
 
@@ -132,6 +158,7 @@ class MemoryStore:
         # state.db / kanban.db — see hermes_state._WAL_INCOMPAT_MARKERS).
         from hermes_state import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="memory_store.db (holographic)")
+        self._conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         self._conn.executescript(_SCHEMA)
         # Migrate: add hrr_vector column if missing (safe for existing databases)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
@@ -155,11 +182,11 @@ class MemoryStore:
         the existing fact_id without modifying the row. Extracts entities from
         the content and links them to the fact.
         """
-        with self._lock:
-            content = content.strip()
-            if not content:
-                raise ValueError("content must not be empty")
+        content = content.strip()
+        if not content:
+            raise ValueError("content must not be empty")
 
+        def _do() -> int:
             try:
                 cur = self._conn.execute(
                     """
@@ -188,6 +215,8 @@ class MemoryStore:
 
             return fact_id
 
+        return self._execute_write(_do)
+
     def search_facts(
         self,
         query: str,
@@ -200,11 +229,11 @@ class MemoryStore:
         Returns a list of fact dicts ordered by FTS5 rank, then trust_score
         descending. Also increments retrieval_count for matched facts.
         """
-        with self._lock:
-            query = query.strip()
-            if not query:
-                return []
+        query = query.strip()
+        if not query:
+            return []
 
+        def _do() -> list[dict]:
             params: list = [query, min_trust]
             category_clause = ""
             if category is not None:
@@ -239,6 +268,8 @@ class MemoryStore:
 
             return results
 
+        return self._execute_write(_do)
+
     def update_fact(
         self,
         fact_id: int,
@@ -251,7 +282,7 @@ class MemoryStore:
 
         Returns True if the row existed, False otherwise.
         """
-        with self._lock:
+        def _do() -> bool:
             row = self._conn.execute(
                 "SELECT fact_id, trust_score FROM facts WHERE fact_id = ?", (fact_id,)
             ).fetchone()
@@ -303,9 +334,11 @@ class MemoryStore:
 
             return True
 
+        return self._execute_write(_do)
+
     def remove_fact(self, fact_id: int) -> bool:
         """Delete a fact and its entity links. Returns True if the row existed."""
-        with self._lock:
+        def _do() -> bool:
             row = self._conn.execute(
                 "SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,)
             ).fetchone()
@@ -319,6 +352,8 @@ class MemoryStore:
             self._conn.commit()
             self._rebuild_bank(row["category"])
             return True
+
+        return self._execute_write(_do)
 
     def list_facts(
         self,
@@ -359,7 +394,7 @@ class MemoryStore:
         Returns a dict with fact_id, old_trust, new_trust, helpful_count.
         Raises KeyError if fact_id does not exist.
         """
-        with self._lock:
+        def _do() -> dict:
             row = self._conn.execute(
                 "SELECT fact_id, trust_score, helpful_count FROM facts WHERE fact_id = ?",
                 (fact_id,),
@@ -390,6 +425,8 @@ class MemoryStore:
                 "new_trust":    new_trust,
                 "helpful_count": row["helpful_count"] + helpful_increment,
             }
+
+        return self._execute_write(_do)
 
     # ------------------------------------------------------------------
     # Entity helpers
@@ -562,6 +599,31 @@ class MemoryStore:
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
+
+    def _execute_write(self, fn: "callable") -> "object":
+        """Run *fn()* inside the shared lock, retrying on sqlite locked/busy.
+
+        On 'database is locked' / 'database is busy', releases the lock, waits
+        a random jitter interval, then retries — breaking the convoy pattern
+        that SQLite's deterministic backoff creates when multiple instances
+        hammer the same WAL file.
+        """
+        last_err: sqlite3.OperationalError | None = None
+        for attempt in range(_WRITE_MAX_RETRIES):
+            try:
+                with self._lock:
+                    return fn()
+            except sqlite3.OperationalError as exc:
+                err = str(exc).lower()
+                if "locked" in err or "busy" in err:
+                    last_err = exc
+                    if attempt < _WRITE_MAX_RETRIES - 1:
+                        time.sleep(random.uniform(_WRITE_RETRY_MIN_S, _WRITE_RETRY_MAX_S))
+                        continue
+                raise
+        raise last_err or sqlite3.OperationalError(
+            "database is locked after max retries"
+        )
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict:
         """Convert a sqlite3.Row to a plain dict."""
