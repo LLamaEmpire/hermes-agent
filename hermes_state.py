@@ -5039,9 +5039,12 @@ class SessionDB:
     def apply_hrm_t0a_migration(self) -> None:
         """Create active_topic_pointer + move_log tables on first explicit use.
 
-        Schema:
+        Schema (v2):
           active_topic_pointer — same-chat routing pointer keyed by
-            (platform, user_id, chat_id, app_id) → topic_id.
+            (platform, user_id, chat_id, thread_id, app_id) → topic_id.
+            ``thread_id`` scopes the pointer to a Telegram forum thread
+            (or equivalent per-thread surface). Empty string is the
+            backwards-compatible whole-chat (no-thread) default.
           move_log — idempotent audit row per session-move call,
             keyed by (idempotency_key, src_session_id, dst_session_id).
 
@@ -5049,8 +5052,15 @@ class SessionDB:
         moved_to_message_id, moved_at) are declared in SCHEMA_SQL and
         picked up by _reconcile_columns() at startup; this migration
         only owns the new side tables.
+
+        Idempotent: safe to call repeatedly. Includes an in-place v1→v2
+        upgrade that adds ``thread_id`` to the PK when the table already
+        exists from a prior v1 deployment.
         """
         def _do(conn):
+            # v1 DDL — uses IF NOT EXISTS so it is a no-op on a v1 or v2
+            # table that already exists. The v1→v2 rename upgrade below
+            # handles installations that have the old 4-column PK.
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS active_topic_pointer (
@@ -5086,6 +5096,8 @@ class SessionDB:
                     ON move_log (dst_session_id, committed_at);
                 """
             )
+            # executescript() above auto-committed; these run in a new
+            # implicit transaction that _execute_write commits.
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -5111,6 +5123,108 @@ class SessionDB:
                     ("hrm_t0a_applied_at", repr(stamp)),
                 )
         self._execute_write(_do)
+        # After the v1 tables exist, upgrade to v2 (thread_id in PK).
+        self._apply_hrm_t0a_thread_id_upgrade()
+
+    def _apply_hrm_t0a_thread_id_upgrade(self) -> None:
+        """Upgrade active_topic_pointer PK to include thread_id (v1 → v2).
+
+        Idempotent: checks the column list before acting; a no-op when the
+        table already has ``thread_id``. Migrates existing rows to
+        ``thread_id = ''`` (the whole-chat backward-compatible default) so
+        running sessions continue to route without interruption.
+        """
+        with self._lock:
+            try:
+                ver_row = self._conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    ("hrm_t0a_schema_version",),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return  # Tables not yet created; upgrade will run after v1 migration
+            ver = ver_row[0] if ver_row else None
+            if ver == "2":
+                return  # Already at v2
+            try:
+                cols_info = self._conn.execute(
+                    "PRAGMA table_info('active_topic_pointer')"
+                ).fetchall()
+                col_names = {row[1] for row in cols_info}
+                has_thread_id = "thread_id" in col_names
+            except sqlite3.OperationalError:
+                return
+
+        if has_thread_id:
+            # thread_id column is present but version not yet "2" — just stamp
+            def _stamp(conn):
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("hrm_t0a_schema_version", "2"),
+                )
+            self._execute_write(_stamp)
+            return
+
+        # v1 → v2: create new table with thread_id in PK, copy rows, rename.
+        def _do_v2(conn):
+            # Re-check inside the write window — another thread may have
+            # already completed the migration between our pre-check and now.
+            try:
+                cols_info = conn.execute(
+                    "PRAGMA table_info('active_topic_pointer')"
+                ).fetchall()
+                col_names = {row[1] for row in cols_info}
+            except sqlite3.OperationalError:
+                return
+            if "thread_id" in col_names:
+                # Race: already migrated — just update version stamp
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("hrm_t0a_schema_version", "2"),
+                )
+                return
+            # executescript() commits the BEGIN IMMEDIATE from _execute_write,
+            # then runs the DDL atomically.
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS active_topic_pointer_v2 (
+                    platform        TEXT NOT NULL,
+                    user_id         TEXT NOT NULL,
+                    chat_id         TEXT NOT NULL,
+                    thread_id       TEXT NOT NULL DEFAULT '',
+                    app_id          TEXT NOT NULL,
+                    topic_id        TEXT NOT NULL,
+                    bound_thread_id TEXT,
+                    updated_at      REAL NOT NULL,
+                    updated_by      TEXT NOT NULL,
+                    PRIMARY KEY (platform, user_id, chat_id, thread_id, app_id)
+                );
+
+                INSERT OR IGNORE INTO active_topic_pointer_v2
+                    (platform, user_id, chat_id, thread_id, app_id,
+                     topic_id, bound_thread_id, updated_at, updated_by)
+                SELECT platform, user_id, chat_id, '', app_id,
+                       topic_id, bound_thread_id, updated_at, updated_by
+                FROM active_topic_pointer;
+
+                DROP TABLE active_topic_pointer;
+
+                ALTER TABLE active_topic_pointer_v2
+                    RENAME TO active_topic_pointer;
+
+                CREATE INDEX IF NOT EXISTS idx_atp_app_topic
+                    ON active_topic_pointer (app_id, topic_id);
+                """
+            )
+            # executescript auto-committed; this starts a new implicit txn
+            # that _execute_write commits.
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("hrm_t0a_schema_version", "2"),
+            )
+        self._execute_write(_do_v2)
 
     # ── active_topic_pointer accessors ──────────────────────────────────
 
@@ -5120,23 +5234,31 @@ class SessionDB:
         platform: str,
         user_id: str,
         chat_id: str,
+        thread_id: str = "",
         app_id: str,
     ) -> Optional[Dict[str, Any]]:
-        """Return the pointer row for the principal/app, or None if unset.
+        """Return the pointer row for the principal/app/thread, or None if unset.
+
+        ``thread_id`` scopes the lookup to a Telegram forum thread (or
+        equivalent); pass ``""`` (default) for the whole-chat pointer
+        (backwards-compatible behaviour for sessions without a thread
+        dimension).
 
         Read-only: does NOT trigger the HRM-T0a migration. If the side
         tables haven't been created yet, callers see ``None`` (legacy /
         unrouted) without paying the migration cost on the hot read path.
         """
+        tid = str(thread_id) if thread_id is not None else ""
         with self._lock:
             try:
                 row = self._conn.execute(
                     """
                     SELECT topic_id, bound_thread_id, updated_at, updated_by
                     FROM active_topic_pointer
-                    WHERE platform = ? AND user_id = ? AND chat_id = ? AND app_id = ?
+                    WHERE platform = ? AND user_id = ? AND chat_id = ?
+                      AND thread_id = ? AND app_id = ?
                     """,
-                    (str(platform), str(user_id), str(chat_id), str(app_id)),
+                    (str(platform), str(user_id), str(chat_id), tid, str(app_id)),
                 ).fetchone()
             except sqlite3.OperationalError:
                 return None
@@ -5162,18 +5284,24 @@ class SessionDB:
         platform: str,
         user_id: str,
         chat_id: str,
+        thread_id: str = "",
         app_id: str,
         topic_id: str,
         bound_thread_id: Optional[str] = None,
         updated_by: str,
     ) -> Dict[str, Any]:
-        """Upsert the pointer for the principal/app to *topic_id*.
+        """Upsert the pointer for the principal/app/thread to *topic_id*.
+
+        ``thread_id`` scopes the pointer to a Telegram forum thread (or
+        equivalent); pass ``""`` (default) for the whole-chat pointer.
 
         Returns ``{"prior": <prior_row_or_None>, "current": <new_row>}`` so
         the caller can compose a compensating ``set_active_topic`` if a
         downstream step (e.g. confirmation banner emit) fails after commit.
 
-        Triggers the HRM-T0a migration on first call.
+        Triggers the HRM-T0a migration (including v1→v2 upgrade) on first
+        call, so callers never need to call ``apply_hrm_t0a_migration``
+        explicitly.
         """
         if not topic_id:
             raise ValueError("topic_id is required")
@@ -5181,23 +5309,25 @@ class SessionDB:
             raise ValueError("updated_by is required (provenance for audit)")
         self.apply_hrm_t0a_migration()
         now = time.time()
+        tid = str(thread_id) if thread_id is not None else ""
 
         def _do(conn):
             prior_row = conn.execute(
                 """
                 SELECT topic_id, bound_thread_id, updated_at, updated_by
                 FROM active_topic_pointer
-                WHERE platform = ? AND user_id = ? AND chat_id = ? AND app_id = ?
+                WHERE platform = ? AND user_id = ? AND chat_id = ?
+                  AND thread_id = ? AND app_id = ?
                 """,
-                (str(platform), str(user_id), str(chat_id), str(app_id)),
+                (str(platform), str(user_id), str(chat_id), tid, str(app_id)),
             ).fetchone()
             conn.execute(
                 """
                 INSERT INTO active_topic_pointer (
-                    platform, user_id, chat_id, app_id,
+                    platform, user_id, chat_id, thread_id, app_id,
                     topic_id, bound_thread_id, updated_at, updated_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(platform, user_id, chat_id, app_id) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, user_id, chat_id, thread_id, app_id) DO UPDATE SET
                     topic_id = excluded.topic_id,
                     bound_thread_id = excluded.bound_thread_id,
                     updated_at = excluded.updated_at,
@@ -5207,6 +5337,7 @@ class SessionDB:
                     str(platform),
                     str(user_id),
                     str(chat_id),
+                    tid,
                     str(app_id),
                     str(topic_id),
                     str(bound_thread_id) if bound_thread_id else None,
@@ -5247,27 +5378,35 @@ class SessionDB:
         platform: str,
         user_id: str,
         chat_id: str,
+        thread_id: str = "",
         app_id: str,
         updated_by: str,
     ) -> Optional[Dict[str, Any]]:
-        """Delete the pointer for the principal/app. Returns the prior row, or None."""
+        """Delete the pointer for the principal/app/thread. Returns prior row, or None.
+
+        ``thread_id`` scopes the delete to a specific Telegram forum thread;
+        pass ``""`` (default) for the whole-chat pointer.
+        """
         if not updated_by:
             raise ValueError("updated_by is required (provenance for audit)")
         self.apply_hrm_t0a_migration()
+        tid = str(thread_id) if thread_id is not None else ""
 
         def _do(conn):
             prior_row = conn.execute(
                 """
                 SELECT topic_id, bound_thread_id, updated_at, updated_by
                 FROM active_topic_pointer
-                WHERE platform = ? AND user_id = ? AND chat_id = ? AND app_id = ?
+                WHERE platform = ? AND user_id = ? AND chat_id = ?
+                  AND thread_id = ? AND app_id = ?
                 """,
-                (str(platform), str(user_id), str(chat_id), str(app_id)),
+                (str(platform), str(user_id), str(chat_id), tid, str(app_id)),
             ).fetchone()
             conn.execute(
                 "DELETE FROM active_topic_pointer "
-                "WHERE platform = ? AND user_id = ? AND chat_id = ? AND app_id = ?",
-                (str(platform), str(user_id), str(chat_id), str(app_id)),
+                "WHERE platform = ? AND user_id = ? AND chat_id = ?"
+                "  AND thread_id = ? AND app_id = ?",
+                (str(platform), str(user_id), str(chat_id), tid, str(app_id)),
             )
             if prior_row is None:
                 return None

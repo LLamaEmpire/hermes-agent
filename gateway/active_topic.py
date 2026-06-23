@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -68,7 +69,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-PointerKey = Tuple[str, str, str, str]  # (platform, user_id, chat_id, app_id)
+PointerKey = Tuple[str, str, str, str, str]  # (platform, user_id, chat_id, thread_id_or_default, app_id)
 
 
 # ── PlatformPrincipal envelope ────────────────────────────────────────
@@ -89,16 +90,27 @@ class PlatformPrincipal:
     imported anywhere without dragging the Platform enum into
     foreign codebases (e.g. ``hermes_state``). Conversion happens at
     the boundary.
+
+    ``thread_id`` is the Telegram ``message_thread_id`` (forum topic) or
+    equivalent per-thread surface identifier from other platforms. When
+    present, the pointer is scoped to that physical thread so multiple
+    Hermes topics in one Telegram channel/group stay isolated. ``None``
+    and ``""`` are equivalent and mean "no thread dimension" (whole-chat
+    scope), preserving backwards compatibility for existing rows.
     """
 
     platform: str
     user_id: str
     chat_id: str
     app_id: str
+    thread_id: Optional[str] = None
 
     @property
     def key(self) -> PointerKey:
-        return (self.platform, self.user_id, self.chat_id, self.app_id)
+        # Include thread_id_or_default before app_id so per-thread locks
+        # are distinct from each other and from the whole-chat (empty)
+        # principal for the same chat.
+        return (self.platform, self.user_id, self.chat_id, self.thread_id or "", self.app_id)
 
     @classmethod
     def from_source(
@@ -109,8 +121,8 @@ class PlatformPrincipal:
     ) -> "PlatformPrincipal":
         """Build a principal from a ``SessionSource``-shaped object.
 
-        ``source`` is duck-typed (``.platform``, ``.user_id``, ``.chat_id``)
-        so this module does not need to import the gateway's
+        ``source`` is duck-typed (``.platform``, ``.user_id``, ``.chat_id``,
+        ``.thread_id``) so this module does not need to import the gateway's
         ``SessionSource`` class. ``app_id`` is supplied by the caller
         because its derivation lives at the dev-os boundary, not in
         this module (see charter § Cross-repo execution discipline
@@ -125,6 +137,7 @@ class PlatformPrincipal:
 
         user_id = getattr(source, "user_id", None)
         chat_id = getattr(source, "chat_id", None)
+        thread_id = getattr(source, "thread_id", None)
         if not user_id:
             raise ValueError("source.user_id is required for principal envelope")
         if not chat_id:
@@ -136,6 +149,7 @@ class PlatformPrincipal:
             user_id=str(user_id),
             chat_id=str(chat_id),
             app_id=str(app_id),
+            thread_id=str(thread_id) if thread_id is not None else None,
         )
 
 
@@ -333,6 +347,7 @@ async def read_active_topic(
             platform=principal.platform,
             user_id=principal.user_id,
             chat_id=principal.chat_id,
+            thread_id=principal.thread_id or "",
             app_id=principal.app_id,
         )
 
@@ -374,6 +389,7 @@ async def set_active_topic(
             platform=principal.platform,
             user_id=principal.user_id,
             chat_id=principal.chat_id,
+            thread_id=principal.thread_id or "",
             app_id=principal.app_id,
             topic_id=topic_id,
             bound_thread_id=bound_thread_id,
@@ -395,6 +411,7 @@ async def clear_active_topic(
             platform=principal.platform,
             user_id=principal.user_id,
             chat_id=principal.chat_id,
+            thread_id=principal.thread_id or "",
             app_id=principal.app_id,
             updated_by=updated_by,
         )
@@ -445,22 +462,36 @@ def build_topic_session_key(
 ) -> str:
     """Construct the deterministic topic-routed session key.
 
-    Shape: ``<ns>:topic:<platform>:<chat_id>:<user_id>:<app_id>:<topic_id>``
+    Shape (no thread):  ``<ns>:topic:<platform>:<chat_id>:<user_id>:<app_id>:<topic_id>``
+    Shape (with thread): ``<ns>:topic:<platform>:<chat_id>:<user_id>:<thread_id>:<app_id>:<topic_id>``
+
     where ``<ns>`` is ``agent:main`` for the default profile and
     ``agent:<profile>`` for a named one. The ``topic`` marker after the
     namespace is what distinguishes a topic-routed key from a
     legacy thread-derived key in the same chat — no shared prefix can
     collide with a legacy key.
 
+    When ``principal.thread_id`` is non-empty it is inserted before
+    ``app_id`` so two Telegram forum threads in the same channel/group
+    always route to distinct session keys even when they share the same
+    active topic. The no-thread shape is identical to the pre-thread-id
+    shape, preserving backwards compatibility for existing sessions.
+
     Including ``user_id`` in the key matches the principal contract
-    (pointer is keyed by ``(platform, user_id, chat_id, app_id)``) — so
-    two participants in the same group chat under the same app_id with
+    (pointer is keyed by ``(platform, user_id, chat_id, thread_id, app_id)``) —
+    so two participants in the same group chat under the same app_id with
     the same topic_id still get separate sessions, which is the charter-
     required isolation when ``group_sessions_per_user`` is on.
     """
     if not topic_id:
         raise ValueError("topic_id is required for topic session key")
     ns = _session_key_namespace_for_topic(profile)
+    tid = principal.thread_id or ""
+    if tid:
+        return (
+            f"{ns}:topic:{principal.platform}:{principal.chat_id}:"
+            f"{principal.user_id}:{tid}:{principal.app_id}:{topic_id}"
+        )
     return (
         f"{ns}:topic:{principal.platform}:{principal.chat_id}:"
         f"{principal.user_id}:{principal.app_id}:{topic_id}"
@@ -511,6 +542,7 @@ def resolve_topic_session_key(
             platform=principal.platform,
             user_id=principal.user_id,
             chat_id=principal.chat_id,
+            thread_id=principal.thread_id or "",
             app_id=principal.app_id,
         )
     except Exception:  # noqa: BLE001 — defensive: any DB error falls through
@@ -700,6 +732,7 @@ def is_legacy_principal_route(
                 platform=str(platform_str),
                 user_id=str(user_id),
                 chat_id=str(chat_id),
+                thread_id="",
                 app_id=str(app_id),
             )
         except Exception:  # noqa: BLE001
@@ -901,6 +934,7 @@ async def resolve_topic_session_key_async(
                 platform=principal.platform,
                 user_id=principal.user_id,
                 chat_id=principal.chat_id,
+                thread_id=principal.thread_id or "",
                 app_id=principal.app_id,
             )
         except Exception:  # noqa: BLE001
@@ -927,3 +961,147 @@ async def resolve_topic_session_key_async(
             if not ok:
                 return None
         return build_topic_session_key(principal, topic_id=topic_id, profile=profile)
+
+
+# ── Natural-language Telegram topic directives ────────────────────────
+#
+# These helpers parse and execute owner NL commands like
+# "set topic to scout", "clear topic", "topic status" sent as plain
+# Telegram messages (no slash prefix). They must run BEFORE the agent
+# runner so a directive is never forwarded as a user turn to the LLM.
+#
+# Design constraints:
+#   - Uses existing set/clear/read wrappers; no duplicate topic model.
+#   - Validates against registry via assert_registered; fails closed
+#     on unknown topic (no write, typed error reply).
+#   - Operates on the per-thread principal so two forum threads in the
+#     same channel/group never share a pointer row.
+#   - Returns None for non-directives so callers can fall through.
+
+_NL_TOPIC_SET_RE = re.compile(
+    r"^\s*(?:set|switch|change)\s+topic\s+to\s+(\S+)\s*$",
+    re.IGNORECASE,
+)
+_NL_TOPIC_BARE_RE = re.compile(
+    r"^\s*topic\s+(\S+)\s*$",
+    re.IGNORECASE,
+)
+_NL_TOPIC_CLEAR_RE = re.compile(
+    r"^\s*(?:clear|reset)\s+topic\s*$",
+    re.IGNORECASE,
+)
+_NL_TOPIC_STATUS_RE = re.compile(
+    r"^\s*(?:topic\s+status|what(?:'?s|\s+is)?\s+(?:the\s+)?(?:active\s+)?topic"
+    r"(?:\s+(?:for\s+)?(?:here|this(?:\s+thread)?))?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_telegram_topic_directive(
+    text: str,
+) -> Optional[Tuple[str, Optional[str]]]:
+    """Parse a natural-language topic directive.
+
+    Returns ``(command, topic_id)`` or ``None`` if the text is not a
+    recognized directive. ``command`` is one of ``"set"``, ``"clear"``,
+    ``"status"``. ``topic_id`` is present only for ``"set"``.
+
+    Recognized phrases:
+    - "set|switch|change topic to <topic>"
+    - "topic <topic>"  (bare topic-name shortcut)
+    - "clear|reset topic"
+    - "topic status"
+    - "what('s| is) (the|active) topic (for here|for this thread|here|…)"
+    """
+    if not text:
+        return None
+    s = text.strip()
+    m = _NL_TOPIC_SET_RE.match(s)
+    if m:
+        return ("set", m.group(1).lower())
+    m = _NL_TOPIC_BARE_RE.match(s)
+    if m:
+        candidate = m.group(1).lower()
+        # Exclude bare "topic status" — caught by the status regex.
+        if candidate != "status":
+            return ("set", candidate)
+    if _NL_TOPIC_CLEAR_RE.match(s):
+        return ("clear", None)
+    if _NL_TOPIC_STATUS_RE.match(s):
+        return ("status", None)
+    return None
+
+
+async def handle_telegram_topic_directive(
+    source: Any,
+    session_db: Any,
+    *,
+    app_id: str,
+    text: str,
+    updated_by: str = "telegram:nl_directive",
+) -> Optional[str]:
+    """Handle a natural-language topic directive from a Telegram surface.
+
+    Returns a reply string when *text* is a recognized directive, or
+    ``None`` if it is not. The caller must NOT send the text to the agent
+    runner when a non-None reply is returned.
+
+    Operates on the per-thread pointer: if ``source.thread_id`` is set
+    the write/read is scoped to that Telegram forum thread; otherwise
+    it falls back to the whole-chat (thread_id="") pointer.
+    """
+    directive = parse_telegram_topic_directive(text)
+    if directive is None:
+        return None
+    command, topic_id = directive
+
+    try:
+        principal = PlatformPrincipal.from_source(source, app_id=app_id)
+    except ValueError:
+        return None
+
+    if command == "set":
+        assert topic_id is not None  # invariant: "set" always has topic_id
+        try:
+            result = await set_active_topic(
+                session_db,
+                principal,
+                topic_id=topic_id,
+                bound_thread_id=principal.thread_id or None,
+                updated_by=updated_by,
+                require_registered=True,
+            )
+        except TopicNotRegisteredError as exc:
+            msg = str(exc)
+            if "no registry checker wired" in msg:
+                return (
+                    f'Topic registry is not configured — cannot set topic to "{topic_id}".'
+                )
+            return (
+                f'Unknown topic "{topic_id}". '
+                f"Check the registered topics and try again."
+            )
+        prior = result.get("prior")
+        if prior and prior.get("topic_id") == topic_id:
+            return f'Topic is already "{topic_id}" for this thread.'
+        elif prior:
+            return (
+                f'Switched topic from "{prior["topic_id"]}" to "{topic_id}".'
+            )
+        return f'Topic set to "{topic_id}" for this thread.'
+
+    elif command == "clear":
+        prior = await clear_active_topic(
+            session_db, principal, updated_by=updated_by
+        )
+        if prior:
+            return f'Cleared topic "{prior["topic_id"]}" for this thread.'
+        return "No active topic to clear for this thread."
+
+    elif command == "status":
+        row = await read_active_topic(session_db, principal)
+        if row:
+            return f'Active topic for this thread: "{row["topic_id"]}".'
+        return "No active topic set for this thread."
+
+    return None

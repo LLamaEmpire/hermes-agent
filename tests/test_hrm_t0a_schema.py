@@ -62,7 +62,7 @@ def test_apply_hrm_t0a_migration_creates_tables_and_is_idempotent(tmp_path):
     assert "idx_move_log_src" in indexes
     assert "idx_move_log_dst" in indexes
 
-    assert db.get_meta("hrm_t0a_schema_version") == "1"
+    assert db.get_meta("hrm_t0a_schema_version") == "2"
 
     applied_at = db.get_meta("hrm_t0a_applied_at")
     assert applied_at is not None
@@ -473,4 +473,93 @@ def test_read_move_log_empty_before_migration(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     # No migration applied.
     assert db.read_move_log(session_id="anything") == []
+    db.close()
+
+
+# ── Migration backcompat: v1 → v2 thread_id upgrade ───────────────────
+
+
+def test_v1_rows_readable_after_thread_id_upgrade(tmp_path):
+    """Old active_topic rows written without thread_id survive the v1→v2 upgrade.
+
+    Simulates a pre-thread_id deployment: creates the v1 table (4-column PK,
+    no thread_id), inserts a pointer row, runs the upgrade, then verifies the
+    row is accessible via read_active_topic with thread_id="" (the upgraded
+    backwards-compatible default).
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    # Manually create the v1 active_topic_pointer table (no thread_id column).
+    # executescript auto-commits, which is fine here.
+    db._conn.executescript("""
+        CREATE TABLE IF NOT EXISTS active_topic_pointer (
+            platform        TEXT NOT NULL,
+            user_id         TEXT NOT NULL,
+            chat_id         TEXT NOT NULL,
+            app_id          TEXT NOT NULL,
+            topic_id        TEXT NOT NULL,
+            bound_thread_id TEXT,
+            updated_at      REAL NOT NULL,
+            updated_by      TEXT NOT NULL,
+            PRIMARY KEY (platform, user_id, chat_id, app_id)
+        );
+    """)
+    # Insert a v1-style row.
+    db._conn.execute(
+        "INSERT INTO active_topic_pointer "
+        "(platform, user_id, chat_id, app_id, topic_id, bound_thread_id, "
+        "updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("telegram", "208214988", "208214988", "hermes-agent",
+         "research", None, 1234567890.0, "legacy-write"),
+    )
+    # Stamp v1 schema version so the upgrade knows there's work to do.
+    db._conn.execute(
+        "INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
+        ("hrm_t0a_schema_version", "1"),
+    )
+    db._conn.commit()
+
+    # Run the v1 → v2 upgrade (adds thread_id to PK, migrates rows to thread_id='').
+    db._apply_hrm_t0a_thread_id_upgrade()
+
+    # Old row must be accessible via thread_id="" after upgrade.
+    row = db.read_active_topic(
+        platform="telegram",
+        user_id="208214988",
+        chat_id="208214988",
+        thread_id="",
+        app_id="hermes-agent",
+    )
+    assert row is not None, "v1 row must be preserved by the thread_id upgrade"
+    assert row["topic_id"] == "research"
+
+    # New rows written after upgrade must accept a thread_id surface dimension.
+    db.set_active_topic(
+        platform="telegram",
+        user_id="208214988",
+        chat_id="208214988",
+        thread_id="5001",
+        app_id="hermes-agent",
+        topic_id="implementation",
+        updated_by="post-upgrade-write",
+    )
+    thread_row = db.read_active_topic(
+        platform="telegram",
+        user_id="208214988",
+        chat_id="208214988",
+        thread_id="5001",
+        app_id="hermes-agent",
+    )
+    assert thread_row is not None
+    assert thread_row["topic_id"] == "implementation"
+
+    # The legacy whole-chat row is unaffected by the new thread-scoped row.
+    old_row = db.read_active_topic(
+        platform="telegram",
+        user_id="208214988",
+        chat_id="208214988",
+        thread_id="",
+        app_id="hermes-agent",
+    )
+    assert old_row is not None
+    assert old_row["topic_id"] == "research"
     db.close()

@@ -3443,6 +3443,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
+    async def _try_handle_telegram_topic_directive(
+        self,
+        event: Any,
+        source: Any,
+    ) -> Optional[str]:
+        """Return reply text if *event* is a Telegram NL topic directive, else None.
+
+        Fires for Telegram free-text messages only (no slash prefix). When a
+        directive is detected the pointer is updated/read and the reply is
+        returned — the caller must NOT forward the text to the agent runner.
+
+        Error isolation: if the text IS a recognized directive but the handler
+        raises, this function returns a non-None error reply so the message is
+        never forwarded to the agent runner (fail-closed contract).
+        """
+        try:
+            from gateway.active_topic import (
+                handle_telegram_topic_directive,
+                parse_telegram_topic_directive,
+            )
+        except ImportError:
+            return None
+        config = getattr(self, "config", None)
+        app_id = getattr(config, "topic_default_app_id", None)
+        if not app_id:
+            return None
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return None
+        text = getattr(event, "text", None) or ""
+        if not text.strip():
+            return None
+        # Pre-parse: return None for non-directives so they fall through to
+        # the agent runner unchanged.
+        if parse_telegram_topic_directive(text) is None:
+            return None
+        # Recognized directive: must NEVER fall through to the agent runner,
+        # even if the handler errors. Return an error reply on exception.
+        user_id = getattr(source, "user_id", None) or "unknown"
+        try:
+            return await handle_telegram_topic_directive(
+                source,
+                session_db,
+                app_id=app_id,
+                text=text,
+                updated_by=f"telegram:nl:{user_id}",
+            )
+        except Exception:
+            logger.debug(
+                "NL topic directive handling raised (fail-closed)", exc_info=True
+            )
+            return "Topic directive encountered an unexpected error. Please try again."
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -8569,6 +8622,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
+
+        # HRM-T0a: intercept natural-language topic directives before the
+        # agent runner claims the session. Fires only for plain Telegram
+        # messages (no slash prefix) when pointer mode is enabled.
+        if source.platform == Platform.TELEGRAM and not command:
+            _nl_topic_reply = await self._try_handle_telegram_topic_directive(
+                event, source
+            )
+            if _nl_topic_reply is not None:
+                return _nl_topic_reply
 
         if self._is_telegram_topic_root_lobby(source):
             # Debounce the lobby reminder so a user who forgets about
