@@ -53,7 +53,9 @@ def test_platform_principal_from_real_session_source():
     assert p.chat_id == "208214988"
     assert p.user_id == "208214988"
     assert p.app_id == "hermes-agent"
-    assert p.key == ("telegram", "208214988", "208214988", "hermes-agent")
+    assert p.thread_id is None
+    # key includes thread_id_or_default ("") before app_id
+    assert p.key == ("telegram", "208214988", "208214988", "", "hermes-agent")
 
 
 def test_platform_principal_from_duck_typed_object():

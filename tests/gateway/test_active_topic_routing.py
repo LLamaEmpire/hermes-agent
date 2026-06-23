@@ -124,6 +124,48 @@ def test_topic_session_key_isolates_apps_and_topics_and_users():
     )
 
 
+def test_build_topic_session_key_thread_id_a_b_differ():
+    """Same chat/user/app/topic but different thread_id must produce different keys.
+
+    Charter contract: two Telegram forum threads in the same channel/group
+    with the same active topic must route to distinct session keys so their
+    conversation histories never cross-contaminate.
+    """
+    p_a = PlatformPrincipal("telegram", "u1", "c1", "app1", thread_id="A")
+    p_b = PlatformPrincipal("telegram", "u1", "c1", "app1", thread_id="B")
+    key_a = build_topic_session_key(p_a, topic_id="scout")
+    key_b = build_topic_session_key(p_b, topic_id="scout")
+    assert key_a != key_b, "different thread_id must produce different session keys"
+    assert "A" in key_a
+    assert "B" in key_b
+
+
+def test_build_topic_session_key_no_thread_is_backcompat():
+    """No-thread principal key shape is stable (backwards-compatible).
+
+    The no-thread form predates the thread_id dimension; it must not gain
+    an extra colon-segment when thread_id is absent (None or empty string).
+    Shape: agent:main:topic:<platform>:<chat_id>:<user_id>:<app_id>:<topic_id>
+    """
+    p_no_thread = PlatformPrincipal("telegram", "u1", "c1", "app1")
+    key = build_topic_session_key(p_no_thread, topic_id="research")
+    parts = key.split(":")
+    # Exactly 8 colon-separated segments — no thread_id segment inserted.
+    assert len(parts) == 8, (
+        f"no-thread key must have 8 parts, got {len(parts)}: {key}"
+    )
+    assert parts == ["agent", "main", "topic", "telegram", "c1", "u1", "app1", "research"]
+
+
+def test_build_topic_session_key_thread_and_no_thread_differ():
+    """A principal with thread_id must not collide with the no-thread principal."""
+    p_thread = PlatformPrincipal("telegram", "u1", "c1", "app1", thread_id="999")
+    p_no_thread = PlatformPrincipal("telegram", "u1", "c1", "app1")
+    key_thread = build_topic_session_key(p_thread, topic_id="scout")
+    key_no_thread = build_topic_session_key(p_no_thread, topic_id="scout")
+    assert key_thread != key_no_thread
+
+
 # ── resolve_topic_session_key (sync) — fall-through paths ─────────────
 
 
@@ -174,18 +216,21 @@ def test_resolve_pre_pass_returns_none_when_no_pointer(tmp_path):
 def test_resolve_pre_pass_returns_topic_key_when_pointer_and_registered(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     set_registered_check(_ok_checker())
+    # thread_id must match _source() so the PK lookup finds the pointer row.
     db.set_active_topic(
         platform="telegram",
         user_id="208214988",
         chat_id="208214988",
+        thread_id="1234",
         app_id="hermes-agent",
         topic_id="research",
         updated_by="x",
     )
     try:
         key = resolve_topic_session_key(_source(), db, app_id="hermes-agent")
+        # Key includes thread_id="1234" segment (with-thread shape).
         assert key == (
-            "agent:main:topic:telegram:208214988:208214988:hermes-agent:research"
+            "agent:main:topic:telegram:208214988:208214988:1234:hermes-agent:research"
         )
     finally:
         db.close()
@@ -254,10 +299,12 @@ def test_resolve_pre_pass_can_skip_registry_check(tmp_path):
     routing must always pass True.
     """
     db = SessionDB(db_path=tmp_path / "state.db")
+    # thread_id must match _source() so the PK lookup finds the pointer row.
     db.set_active_topic(
         platform="telegram",
         user_id="208214988",
         chat_id="208214988",
+        thread_id="1234",
         app_id="hermes-agent",
         topic_id="research",
         updated_by="x",
@@ -282,10 +329,12 @@ def test_resolve_pre_pass_can_skip_registry_check(tmp_path):
 def test_resolve_async_wraps_with_lock_and_returns_key(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     set_registered_check(_ok_checker())
+    # thread_id must match _source() so the PK lookup finds the pointer row.
     db.set_active_topic(
         platform="telegram",
         user_id="208214988",
         chat_id="208214988",
+        thread_id="1234",
         app_id="hermes-agent",
         topic_id="research",
         updated_by="x",
@@ -333,10 +382,12 @@ def test_resolve_async_lock_released_before_response_decision(tmp_path):
     """
     db = SessionDB(db_path=tmp_path / "state.db")
     set_registered_check(_ok_checker())
+    # thread_id must match _source() so the PK lookup finds the pointer row.
     db.set_active_topic(
         platform="telegram",
         user_id="208214988",
         chat_id="208214988",
+        thread_id="1234",
         app_id="hermes-agent",
         topic_id="research",
         updated_by="x",
@@ -367,10 +418,12 @@ def test_session_store_uses_topic_pre_pass_when_pointer_present(tmp_path):
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path=db_path)
     set_registered_check(_ok_checker())
+    # thread_id must match _source() so the PK lookup finds the pointer row.
     db.set_active_topic(
         platform="telegram",
         user_id="208214988",
         chat_id="208214988",
+        thread_id="1234",
         app_id="hermes-agent",
         topic_id="research",
         updated_by="x",
@@ -504,11 +557,12 @@ def test_two_topics_same_principal_route_to_different_session_keys(tmp_path):
     store._db = SessionDB(db_path=db_path)
 
     try:
-        # Switch to topic A.
+        # Switch to topic A (thread_id must match _source() for PK lookup).
         db.set_active_topic(
             platform="telegram",
             user_id="208214988",
             chat_id="208214988",
+            thread_id="1234",
             app_id="hermes-agent",
             topic_id="topic-A",
             updated_by="x",
@@ -520,6 +574,7 @@ def test_two_topics_same_principal_route_to_different_session_keys(tmp_path):
             platform="telegram",
             user_id="208214988",
             chat_id="208214988",
+            thread_id="1234",
             app_id="hermes-agent",
             topic_id="topic-B",
             updated_by="x",
