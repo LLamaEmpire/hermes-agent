@@ -60,6 +60,12 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.active_topic import (
+    PlatformPrincipal as _TopicPrincipal,
+    TopicNotRegisteredError as _TopicNotRegisteredError,
+    read_active_topic as _read_active_topic,
+    set_active_topic as _set_active_topic,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1393,6 +1399,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_move_range": {"method": "POST", "path": "/api/sessions/{session_id}/move/range"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "topic_active": {"method": "GET", "path": "/v1/topics/{app_id}/active"},
+                "topic_switch": {"method": "POST", "path": "/v1/topics/switch"},
             },
         })
 
@@ -4722,6 +4730,119 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    # ------------------------------------------------------------------
+    # Topic pointer API  (HRM-T0a dashboard endpoints)
+    #
+    # Default cockpit principal: platform=cockpit, user_id=dashboard,
+    # chat_id=dashboard, app_id=<from request>. All dashboard callers share
+    # this stable identity so topic pointers survive across HTTP sessions.
+    # ------------------------------------------------------------------
+
+    _COCKPIT_PLATFORM = "cockpit"
+    _COCKPIT_USER_ID = "dashboard"
+    _COCKPIT_CHAT_ID = "dashboard"
+
+    def _cockpit_principal(self, app_id: str) -> "_TopicPrincipal":
+        return _TopicPrincipal(
+            platform=self._COCKPIT_PLATFORM,
+            user_id=self._COCKPIT_USER_ID,
+            chat_id=self._COCKPIT_CHAT_ID,
+            app_id=app_id,
+        )
+
+    async def _handle_get_active_topic(self, request: "web.Request") -> "web.Response":
+        """GET /v1/topics/{app_id}/active — read the active topic pointer for a dashboard principal."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        app_id = request.match_info["app_id"]
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+
+        principal = self._cockpit_principal(app_id)
+        try:
+            pointer = await _read_active_topic(db, principal)
+        except Exception as exc:
+            logger.warning("read_active_topic failed for app_id=%r: %s", app_id, exc)
+            return web.json_response(
+                _openai_error("Failed to read active topic", code="topic_read_error"),
+                status=500,
+            )
+
+        reason = None if pointer is not None else "no_topic_set"
+        return web.json_response({
+            "app_id": app_id,
+            "active_topic": pointer,
+            "reason": reason,
+        })
+
+    async def _handle_topic_switch(self, request: "web.Request") -> "web.Response":
+        """POST /v1/topics/switch — switch the active topic pointer for a dashboard principal."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        app_id = body.get("app_id")
+        topic_id = body.get("topic_id")
+        if not app_id or not isinstance(app_id, str):
+            return web.json_response(
+                _openai_error("app_id is required", param="app_id", code="missing_required_param"),
+                status=422,
+            )
+        if not topic_id or not isinstance(topic_id, str):
+            return web.json_response(
+                _openai_error("topic_id is required", param="topic_id", code="missing_required_param"),
+                status=422,
+            )
+
+        source = str(body.get("source") or "dashboard")
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+
+        principal = self._cockpit_principal(app_id)
+        try:
+            result = await _set_active_topic(
+                db,
+                principal,
+                topic_id=topic_id,
+                updated_by=f"api:{source}",
+                require_registered=True,
+            )
+        except _TopicNotRegisteredError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="topic_not_registered"),
+                status=400,
+            )
+        except Exception as exc:
+            logger.warning(
+                "set_active_topic failed for app_id=%r topic_id=%r: %s",
+                app_id, topic_id, exc,
+            )
+            return web.json_response(
+                _openai_error("Failed to switch active topic", code="topic_switch_error"),
+                status=500,
+            )
+
+        return web.json_response({
+            "ok": True,
+            "app_id": app_id,
+            "topic_id": topic_id,
+            "prior": result.get("prior"),
+        })
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -4814,6 +4935,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Topic pointer API (HRM-T0a dashboard endpoints)
+            self._app.router.add_get("/v1/topics/{app_id}/active", self._handle_get_active_topic)
+            self._app.router.add_post("/v1/topics/switch", self._handle_topic_switch)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
