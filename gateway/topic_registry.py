@@ -95,3 +95,76 @@ def make_json_registry_checker(
         return topic_id in topics
 
     return _check
+
+
+def make_multi_app_registry_checker(
+    registry_root: Path,
+) -> Callable[[str, str], Awaitable[bool]]:
+    """Return an async checker that handles any app_id from *registry_root*.
+
+    Unlike :func:`make_json_registry_checker`, this checker is not bound to a
+    specific ``app_id`` at construction time.  For each call it reads
+    ``<registry_root>/<caller_app_id>.json``, making it suitable for the API
+    server where ``app_id`` comes dynamically from the request body.
+
+    All failure modes (missing file, malformed JSON, schema mismatch,
+    ``app_id`` field mismatch in the file) fail closed and log at WARNING.
+    """
+    _root = Path(registry_root)
+
+    async def _check(caller_app_id: str, topic_id: str) -> bool:
+        registry_file = _root / f"{caller_app_id}.json"
+        try:
+            text = registry_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            logger.warning(
+                "topic_registry: registry file not found: %s — failing closed",
+                registry_file,
+            )
+            return False
+        except OSError as exc:
+            logger.warning(
+                "topic_registry: cannot read %s: %s — failing closed",
+                registry_file,
+                exc,
+            )
+            return False
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "topic_registry: malformed JSON in %s: %s — failing closed",
+                registry_file,
+                exc,
+            )
+            return False
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "topic_registry: %s root is not a JSON object — failing closed",
+                registry_file,
+            )
+            return False
+
+        file_app_id = data.get("app_id")
+        if file_app_id != caller_app_id:
+            logger.warning(
+                "topic_registry: %s declares app_id %r but request used %r — failing closed",
+                registry_file,
+                file_app_id,
+                caller_app_id,
+            )
+            return False
+
+        topics = data.get("topics")
+        if not isinstance(topics, dict):
+            logger.warning(
+                "topic_registry: %s 'topics' field is not a JSON object — failing closed",
+                registry_file,
+            )
+            return False
+
+        return topic_id in topics
+
+    return _check
