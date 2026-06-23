@@ -8,6 +8,7 @@ reject-no-checker, round-trip after switch, malformed payload.
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,6 +17,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import gateway.active_topic as active_topic_module
 from gateway.active_topic import set_registered_check
+from gateway.topic_registry import make_json_registry_checker, make_multi_app_registry_checker
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -391,5 +393,192 @@ class TestRoundTrip:
                 data_b = await rd_b.json()
                 assert data_a["active_topic"]["topic_id"] == "topic-a"
                 assert data_b["active_topic"]["topic_id"] == "topic-b"
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# JSON registry-backed positive-path (requirement 4)
+# ---------------------------------------------------------------------------
+# These tests use real registry JSON files — not AsyncMock — to prove the full
+# make_json_registry_checker / make_multi_app_registry_checker → set_registered_check
+# → _handle_topic_switch path works end-to-end.
+
+
+def _write_registry(root, app_id: str, topics: dict) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"{app_id}.json").write_text(
+        json.dumps({"app_id": app_id, "version": 1, "topics": topics}),
+        encoding="utf-8",
+    )
+
+
+class TestJsonRegistryBacking:
+    """Positive and negative paths with a real JSON registry file, not a mock."""
+
+    @pytest.mark.asyncio
+    async def test_registered_topic_via_json_registry_returns_200(self, tmp_path):
+        """A topic present in the JSON registry file → POST switch 200."""
+        app_id = "development-os"
+        registry_dir = tmp_path / "registry"
+        _write_registry(registry_dir, app_id, {"runtime-loop": {}, "daily-standup": {}})
+
+        adapter = _make_adapter()
+        db = _make_real_db(tmp_path)
+        adapter._session_db = db
+        set_registered_check(make_json_registry_checker(registry_dir, app_id))
+        app = _create_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/topics/switch",
+                    json={"app_id": app_id, "topic_id": "runtime-loop"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["ok"] is True
+                assert data["topic_id"] == "runtime-loop"
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_unregistered_topic_via_json_registry_returns_400(self, tmp_path):
+        """A topic absent from the JSON registry → fail-closed 400."""
+        app_id = "development-os"
+        registry_dir = tmp_path / "registry"
+        _write_registry(registry_dir, app_id, {"other-topic": {}})
+
+        adapter = _make_adapter()
+        db = _make_real_db(tmp_path)
+        adapter._session_db = db
+        set_registered_check(make_json_registry_checker(registry_dir, app_id))
+        app = _create_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/topics/switch",
+                    json={"app_id": app_id, "topic_id": "runtime-loop"},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert data["error"]["code"] == "topic_not_registered"
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_multi_app_checker_handles_dynamic_app_id(self, tmp_path):
+        """make_multi_app_registry_checker reads any app_id file from registry_root."""
+        registry_dir = tmp_path / "registry"
+        _write_registry(registry_dir, "app-one", {"t1": {}})
+        _write_registry(registry_dir, "app-two", {"t2": {}})
+
+        adapter = _make_adapter()
+        db = _make_real_db(tmp_path)
+        adapter._session_db = db
+        set_registered_check(make_multi_app_registry_checker(registry_dir))
+        app = _create_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                r1 = await cli.post(
+                    "/v1/topics/switch",
+                    json={"app_id": "app-one", "topic_id": "t1"},
+                )
+                assert r1.status == 200
+
+                r2 = await cli.post(
+                    "/v1/topics/switch",
+                    json={"app_id": "app-two", "topic_id": "t2"},
+                )
+                assert r2.status == 200
+
+                # Wrong topic for app-one → 400
+                r3 = await cli.post(
+                    "/v1/topics/switch",
+                    json={"app_id": "app-one", "topic_id": "t2"},
+                )
+                assert r3.status == 400
+                assert r3.content_type == "application/json"
+                err = await r3.json()
+                assert err["error"]["code"] == "topic_not_registered"
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_missing_registry_file_fails_closed_400(self, tmp_path):
+        """Registry root exists but no file for app_id → fail-closed 400."""
+        registry_dir = tmp_path / "registry"
+        registry_dir.mkdir()
+
+        adapter = _make_adapter()
+        db = _make_real_db(tmp_path)
+        adapter._session_db = db
+        set_registered_check(make_multi_app_registry_checker(registry_dir))
+        app = _create_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/topics/switch",
+                    json={"app_id": "development-os", "topic_id": "runtime-loop"},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert data["error"]["code"] == "topic_not_registered"
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Source-field sanitization (Critic followup)
+# ---------------------------------------------------------------------------
+
+
+class TestSourceSanitization:
+    @pytest.mark.asyncio
+    async def test_source_control_chars_stripped(self, tmp_path):
+        """Control characters in source= are stripped before storing as updated_by."""
+        adapter = _make_adapter()
+        db = _make_real_db(tmp_path)
+        adapter._session_db = db
+        set_registered_check(AsyncMock(return_value=True))
+        app = _create_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/topics/switch",
+                    json={"app_id": "myapp", "topic_id": "t1",
+                          "source": "evil\r\nsource\x00injected"},
+                )
+                assert resp.status == 200
+                # Verify the stored pointer's updated_by has no control chars
+                rd = await cli.get("/v1/topics/myapp/active")
+                data = await rd.json()
+                updated_by = data["active_topic"]["updated_by"]
+                assert "\r" not in updated_by
+                assert "\n" not in updated_by
+                assert "\x00" not in updated_by
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_source_length_capped(self, tmp_path):
+        """source= values longer than 128 chars are truncated."""
+        adapter = _make_adapter()
+        db = _make_real_db(tmp_path)
+        adapter._session_db = db
+        set_registered_check(AsyncMock(return_value=True))
+        app = _create_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/topics/switch",
+                    json={"app_id": "myapp", "topic_id": "t1",
+                          "source": "x" * 300},
+                )
+                assert resp.status == 200
+                rd = await cli.get("/v1/topics/myapp/active")
+                data = await rd.json()
+                updated_by = data["active_topic"]["updated_by"]
+                # updated_by is "api:<source>" so total should be <= 4 + 128 = 132
+                assert len(updated_by) <= 132
         finally:
             db.close()

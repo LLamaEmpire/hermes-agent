@@ -859,6 +859,64 @@ except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
 
 
+# ---------------------------------------------------------------------------
+# Topic registry checker — auto-wire for the API server
+# ---------------------------------------------------------------------------
+#
+# The GatewayRunner wires a registry checker at startup (gateway/run.py) when
+# ``topic_pointer_mode_enabled`` is True and ``topic_default_app_id`` is set.
+# That checker is bound to a single app_id and may not be wired at all when
+# the API server is the active platform.
+#
+# The API server receives ``app_id`` dynamically from the request body, so it
+# needs a "multi-app" checker that reads <registry_root>/<app_id>.json for any
+# app_id.  This helper builds that checker and wires it via set_registered_check
+# only when no checker has been wired yet (i.e. it never overrides the gateway
+# runner's checker).  Called once at connect() time so the check is free on the
+# request hot path.
+
+
+def _wire_api_registry_checker_if_needed() -> None:
+    """Wire a multi-app topic registry checker for the API server if none is wired.
+
+    Mirrors the GatewayRunner's priority: config ``topic_registry_root`` first,
+    then ``<HERMES_HOME>/registry``.  No-op when a checker is already wired.
+    Fails silently — topic switch remains fail-closed on any error.
+    """
+    import gateway.active_topic as _at
+    if _at._REGISTERED_CHECK is not None:
+        return  # GatewayRunner already wired a checker; don't clobber it.
+    try:
+        from pathlib import Path as _Path
+        from hermes_cli.config import get_hermes_home as _get_hermes_home
+        from gateway.topic_registry import make_multi_app_registry_checker as _make_checker
+        from gateway.active_topic import set_registered_check as _set_check
+
+        registry_root: Optional["_Path"] = None
+        try:
+            from gateway.run import _load_gateway_config as _lgc
+            from gateway.config import GatewayConfig as _GWCfg
+            gw_cfg = _GWCfg.from_dict(_lgc())
+            if gw_cfg.topic_registry_root:
+                registry_root = _Path(gw_cfg.topic_registry_root)
+        except Exception:
+            pass
+        if registry_root is None:
+            registry_root = _get_hermes_home() / "registry"
+
+        _set_check(_make_checker(registry_root))
+        logger.info(
+            "HRM-T0a (api_server): wired multi-app topic registry checker (root=%s)",
+            registry_root,
+        )
+    except Exception:
+        logger.debug(
+            "HRM-T0a (api_server): registry checker wiring failed — "
+            "topic switch will remain fail-closed",
+            exc_info=True,
+        )
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -4804,7 +4862,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=422,
             )
 
-        source = str(body.get("source") or "dashboard")
+        raw_source = str(body.get("source") or "dashboard")
+        # Sanitize: strip control chars and cap length so updated_by is safe to store.
+        source = re.sub(r'[\r\n\x00-\x1f\x7f]', '', raw_source)[:128] or "dashboard"
         db = self._ensure_session_db()
         if db is None:
             return web.json_response(
@@ -4938,6 +4998,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Topic pointer API (HRM-T0a dashboard endpoints)
             self._app.router.add_get("/v1/topics/{app_id}/active", self._handle_get_active_topic)
             self._app.router.add_post("/v1/topics/switch", self._handle_topic_switch)
+            # Wire the multi-app registry checker so /v1/topics/switch can validate
+            # topic registration.  No-op when the GatewayRunner already wired one.
+            _wire_api_registry_checker_if_needed()
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
