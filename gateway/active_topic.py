@@ -1057,8 +1057,18 @@ async def handle_telegram_topic_directive(
 
     try:
         principal = PlatformPrincipal.from_source(source, app_id=app_id)
-    except ValueError:
-        return None
+    except ValueError as exc:
+        # Source is incomplete (e.g. user_id=None from group observe-attribution
+        # rewrite). Returning None here would let a recognized directive leak to
+        # the agent runner — return an error reply instead so the preempt holds.
+        logger.debug(
+            "NL topic directive: principal assembly failed for directive %r: %s",
+            command, exc,
+        )
+        return (
+            "Topic directive could not be processed "
+            "(incomplete sender context — please try again)."
+        )
 
     if command == "set":
         assert topic_id is not None  # invariant: "set" always has topic_id

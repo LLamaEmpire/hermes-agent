@@ -465,3 +465,163 @@ class TestPreemptContract:
         )
         reply = self._call(stub, self._make_event("set topic to scout"), _source())
         assert reply is None
+
+
+# ── Live surface regression: Telegram group/thread sources ───────────────
+#
+# The live miss: owner sent "topic status" in a Telegram group/thread and it
+# reached the agent runner instead of being intercepted.  These tests model
+# the exact live source shapes so the preempt is verified to hold for:
+#   1. Normal group message (chat_type="group", thread_id set, user_id set).
+#   2. Group observe-attribution message (user_id=None after the rewrite).
+#   3. Non-directive text from a group source (must still fall through).
+#
+# The platform is the Platform.TELEGRAM enum value throughout — that is what
+# the adapter stamps on every message.
+
+
+def _group_source(**overrides):
+    """Build a Telegram group/forum-thread SessionSource."""
+    defaults = dict(
+        platform=Platform.TELEGRAM,
+        chat_id="-100123456789",
+        user_id="208214988",
+        chat_type="group",
+        thread_id="567",
+    )
+    defaults.update(overrides)
+    return SessionSource(**defaults)
+
+
+class TestLiveGroupThreadSurface:
+    """Regression: preempt must hold for group/thread sources, not just DMs."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _make_self(self, *, db, app_id="hermes-agent"):
+        return SimpleNamespace(
+            config=SimpleNamespace(topic_default_app_id=app_id),
+            _session_db=db,
+        )
+
+    def _make_event(self, text: str):
+        return SimpleNamespace(text=text)
+
+    def _call(self, self_stub, event, source):
+        from gateway.run import GatewayRunner
+        return self._run(
+            GatewayRunner._try_handle_telegram_topic_directive(
+                self_stub, event, source
+            )
+        )
+
+    # ── item 1: normal group message, "topic status" ──────────────────────
+
+    def test_topic_status_group_source_returns_non_none(self, tmp_path):
+        """'topic status' from a group/thread source must be preempted.
+
+        This is the exact live miss scenario: owner sent 'topic status' in a
+        Telegram group/thread and it reached the agent runner.
+        """
+        db = SessionDB(db_path=tmp_path / "state.db")
+        stub = self._make_self(db=db)
+        reply = self._call(
+            stub,
+            self._make_event("topic status"),
+            _group_source(),
+        )
+        assert reply is not None, (
+            "recognized 'topic status' from group/thread must be preempted "
+            "(live miss regression)"
+        )
+        db.close()
+
+    def test_set_directive_group_source_returns_non_none(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+
+        async def _ok(app_id, topic_id):
+            return True
+
+        set_registered_check(_ok)
+        stub = self._make_self(db=db)
+        reply = self._call(
+            stub,
+            self._make_event("set topic to scout"),
+            _group_source(),
+        )
+        assert reply is not None, "set directive from group/thread must be preempted"
+        db.close()
+
+    def test_clear_directive_group_source_returns_non_none(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        stub = self._make_self(db=db)
+        reply = self._call(
+            stub,
+            self._make_event("clear topic"),
+            _group_source(),
+        )
+        assert reply is not None, "clear directive from group/thread must be preempted"
+        db.close()
+
+    # ── item 2: user_id=None (observe-attribution rewrite) ───────────────
+
+    def test_topic_status_null_user_id_returns_non_none(self, tmp_path):
+        """Preempt must hold even when source.user_id is None.
+
+        Telegram group observe-attribution rewrites the trigger source with
+        user_id=None before dispatch.  The previous bug: PlatformPrincipal
+        .from_source raised ValueError, handle_telegram_topic_directive
+        returned None, and the directive reached the agent runner.
+        """
+        db = SessionDB(db_path=tmp_path / "state.db")
+        stub = self._make_self(db=db)
+        reply = self._call(
+            stub,
+            self._make_event("topic status"),
+            _group_source(user_id=None),
+        )
+        assert reply is not None, (
+            "recognized directive with user_id=None must still be preempted — "
+            "returning None leaks to the agent runner"
+        )
+        db.close()
+
+    def test_set_directive_null_user_id_returns_non_none(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        stub = self._make_self(db=db)
+        reply = self._call(
+            stub,
+            self._make_event("set topic to scout"),
+            _group_source(user_id=None),
+        )
+        assert reply is not None, (
+            "set directive with user_id=None must be preempted with an error reply"
+        )
+        db.close()
+
+    # ── item 3: non-directive from group source falls through ─────────────
+
+    def test_non_directive_group_source_returns_none(self, tmp_path):
+        """Non-directives from group sources must still fall through to the runner."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        stub = self._make_self(db=db)
+        reply = self._call(
+            stub,
+            self._make_event("can you summarize the last meeting?"),
+            _group_source(),
+        )
+        assert reply is None, "non-directive from group source must return None"
+        db.close()
+
+    def test_non_directive_null_user_id_returns_none(self, tmp_path):
+        """Non-directives with user_id=None must also fall through."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        stub = self._make_self(db=db)
+        reply = self._call(
+            stub,
+            self._make_event("what time is it?"),
+            _group_source(user_id=None),
+        )
+        assert reply is None, "non-directive with user_id=None must return None"
+        db.close()

@@ -3480,10 +3480,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parse_telegram_topic_directive(text) is None:
             return None
         # Recognized directive: must NEVER fall through to the agent runner,
-        # even if the handler errors. Return an error reply on exception.
+        # even if the handler errors or returns None. Return an error reply on
+        # exception, and treat a None return as an internal fault too.
         user_id = getattr(source, "user_id", None) or "unknown"
         try:
-            return await handle_telegram_topic_directive(
+            reply = await handle_telegram_topic_directive(
                 source,
                 session_db,
                 app_id=app_id,
@@ -3495,6 +3496,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "NL topic directive handling raised (fail-closed)", exc_info=True
             )
             return "Topic directive encountered an unexpected error. Please try again."
+        # Defense-in-depth: if the handler returned None for a recognized
+        # directive (e.g. principal assembly failed on an incomplete source),
+        # surface an error so the text is never forwarded to the agent runner.
+        if reply is None:
+            logger.debug(
+                "NL topic directive handler returned None for recognized directive "
+                "(fail-closed); source.user_id=%r platform=%r",
+                getattr(source, "user_id", None),
+                getattr(getattr(source, "platform", None), "value", None),
+            )
+            return "Topic directive could not be processed. Please try again."
+        return reply
 
     def _resolve_session_agent_runtime(
         self,
